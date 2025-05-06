@@ -2,7 +2,7 @@
 streamlit
 yt-dlp
 google-generativeai
-pinecone-client
+pinecone>=4.0.0
 sentence-transformers
 torch
 tqdm
