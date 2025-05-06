@@ -61,7 +61,6 @@ if 'chat_history' not in st.session_state:
 # Load API keys from Streamlit secrets
 try:
     PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
-    PINECONE_ENVIRONMENT = st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter")  # Provide a default
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
     # Initialize Pinecone client with the v3.x API key
@@ -69,7 +68,7 @@ try:
     logger.info("Pinecone client initialized with v3.x syntax")
 except Exception as e:
     st.error(f"Error loading API keys: {str(e)}")
-    st.error("Please make sure you have set up your .streamlit/secrets.toml file with the required API keys.")
+    st.error("Please make sure you have set up your API keys in the Streamlit Cloud dashboard.")
     logger.error(f"Error loading API keys: {str(e)}")
     st.stop()
 
@@ -237,7 +236,13 @@ def create_and_store_embeddings(docs, video_title):
                     pc.create_index(
                         name=PINECONE_INDEX_NAME,
                         dimension=384,  # Dimension for all-MiniLM-L6-v2
-                        metric="cosine"
+                        metric="cosine",
+                        spec={
+                            "serverless": {
+                                "cloud": "aws",
+                                "region": "us-west-2"  # Choose an appropriate region
+                            }
+                        }
                     )
                     st.success(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
                 except Exception as e:
@@ -258,7 +263,7 @@ def create_and_store_embeddings(docs, video_title):
 
                 # Delete existing vectors in this namespace to avoid conflicts
                 try:
-                    # v3.x syntax for deleting (depends on index instance format)
+                    # v3.x syntax for deleting
                     index.delete(namespace=video_namespace, delete_all=True)
                     logger.info(f"Deleted existing vectors in namespace: {video_namespace}")
                 except Exception as e:
@@ -516,16 +521,15 @@ with st.sidebar.expander("How to set up API keys"):
     Create a `.streamlit` directory in your project folder and add a `secrets.toml` file with:
 
     ```toml
-        # Required API keys
-        PINECONE_API_KEY = "your-pinecone-api-key"
-        PINECONE_ENVIRONMENT = "gcp-starter"  # Or your environment
-        GOOGLE_API_KEY = "your-google-api-key"
-        ```
+    # Required API keys
+    PINECONE_API_KEY = "your-pinecone-api-key"
+    GOOGLE_API_KEY = "your-google-api-key"
+    ```
 
-        Get your API keys from:
-        - [Pinecone Console](https://app.pinecone.io)
-        - [Google AI Studio](https://makersuite.google.com/app/apikey)
-        """)
+    Get your API keys from:
+    - [Pinecone Console](https://app.pinecone.io)
+    - [Google AI Studio](https://makersuite.google.com/app/apikey)
+    """)
 
 # Footer
 st.markdown("---")
