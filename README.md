@@ -2,6 +2,10 @@
 
 A conversational AI application that lets users ask questions about YouTube video content using advanced RAG (Retrieval Augmented Generation) techniques. The app extracts transcripts from YouTube videos, processes them, and enables natural language question-answering about the video content.
 
+🌐 Live Demo
+Try out the live demo of this application at:
+https://ai-pdf-langchain-chatbot-app.streamlit.app/
+
 ![YouTube RAG Assistant Banner](https://img.shields.io/badge/YouTube-RAG%20Assistant-red?style=for-the-badge&logo=youtube)
 
 ## 📋 Features
