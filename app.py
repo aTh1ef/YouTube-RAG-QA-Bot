@@ -65,7 +65,7 @@ try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
     # Initialize Pinecone client with the API key
-    pinecone.init(api_key=PINECONE_API_KEY, environment=PINE
+    pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
 except Exception as e:
     st.error(f"Error loading API keys: {str(e)}")
     st.error("Please make sure you have set up your .streamlit/secrets.toml file with the required API keys.")
