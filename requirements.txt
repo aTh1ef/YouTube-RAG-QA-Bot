@@ -1,19 +1,29 @@
-#requirements.txt
-streamlit
-yt-dlp
-google-generativeai
+# Core App
+streamlit==1.45.0
+
+# LLMs & Chains
+langchain==0.2.0
+google-generativeai==0.5.4
+google-ai-generativelanguage==0.4.0
+
+# Pinecone (new SDK only)
 pinecone-client>=3.0.0
-sentence-transformers
-torch
-tqdm
-requests
-numpy
-langsmith
-langchain
-langchain-core
-langchain-google-genai
-langchain-pinecone
-langchain-community
-langchain_huggingface
-youtube-transcript-api
-protobuf
+
+# NLP & Transformers
+transformers==4.41.1
+torch==2.3.0
+scikit-learn==1.5.0
+
+# Data
+pandas==2.2.2
+pyarrow==15.0.2
+pydantic==2.7.1
+
+# Testing (optional in prod)
+pytest==8.2.0
+pytest-asyncio==0.23.6
+syrupy==4.6.1
+
+# Utilities
+numpy==1.26.4
+six==1.16.0
