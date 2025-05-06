@@ -28,7 +28,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.callbacks import StdOutCallbackHandler
 
 # Initialize Pinecone with the updated client
-import Pinecone
+import pinecone
 from langchain_pinecone import PineconeVectorStore
 
 # YouTube Transcript API for getting transcripts directly
