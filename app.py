@@ -28,7 +28,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.callbacks import StdOutCallbackHandler
 
 # Initialize Pinecone with the updated client
-from pinecone import Pinecone  
+# Fix for Pinecone version compatibility
+import pinecone
 from langchain_pinecone import PineconeVectorStore
 
 # YouTube Transcript API for getting transcripts directly
@@ -64,8 +65,16 @@ try:
     PINECONE_ENVIRONMENT = st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter")  # Provide a default
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
-    # Initialize Pinecone client with the API key
-    pinecone.init(api_key=PINECONE_API_KEY)
+    # Initialize Pinecone client with the API key (compatible with both v3 and v4)
+    # Check pinecone version to use appropriate initialization
+    pinecone_version = pinecone.__version__.split('.')[0]
+    if int(pinecone_version) >= 4:
+        # Version 4+ initialization
+        pc = pinecone.Pinecone(api_key=PINECONE_API_KEY)
+    else:
+        # Legacy initialization (v2-v3)
+        pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+        pc = pinecone  # For compatibility with rest of the code
 except Exception as e:
     st.error(f"Error loading API keys: {str(e)}")
     st.error("Please make sure you have set up your .streamlit/secrets.toml file with the required API keys.")
@@ -224,21 +233,40 @@ def create_and_store_embeddings(docs, video_title):
 
         # Check if Pinecone index exists, create if not
         try:
-            index_names = pinecone.list_indexes()
-            if PINECONE_INDEX_NAME not in index_names:
-                st.warning(f"Index '{PINECONE_INDEX_NAME}' not found. Creating a new index...")
-                try:
-                    # Create a new index with the updated SDK
-                    pinecone.create_index(
-                        name=PINECONE_INDEX_NAME,
-                        dimension=384,  # Dimension for all-MiniLM-L6-v2
-                        metric="cosine"
-                    )
-                    st.success(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
-                except Exception as e:
-                    logger.error(f"Failed to create Pinecone index: {str(e)}")
-                    st.error(f"Failed to create Pinecone index: {str(e)}")
-                    return None, None
+            pinecone_version = pinecone.__version__.split('.')[0]
+            
+            if int(pinecone_version) >= 4:
+                # Pinecone v4+ API
+                index_names = [idx["name"] for idx in pc.list_indexes()]
+                if PINECONE_INDEX_NAME not in index_names:
+                    st.warning(f"Index '{PINECONE_INDEX_NAME}' not found. Creating a new index...")
+                    try:
+                        pc.create_index(
+                            name=PINECONE_INDEX_NAME,
+                            dimension=384,  # Dimension for all-MiniLM-L6-v2
+                            metric="cosine"
+                        )
+                        st.success(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
+                    except Exception as e:
+                        logger.error(f"Failed to create Pinecone index: {str(e)}")
+                        st.error(f"Failed to create Pinecone index: {str(e)}")
+                        return None, None
+            else:
+                # Legacy Pinecone v2-v3 API
+                index_names = pc.list_indexes()
+                if PINECONE_INDEX_NAME not in index_names:
+                    st.warning(f"Index '{PINECONE_INDEX_NAME}' not found. Creating a new index...")
+                    try:
+                        pc.create_index(
+                            name=PINECONE_INDEX_NAME,
+                            dimension=384,  # Dimension for all-MiniLM-L6-v2
+                            metric="cosine"
+                        )
+                        st.success(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
+                    except Exception as e:
+                        logger.error(f"Failed to create Pinecone index: {str(e)}")
+                        st.error(f"Failed to create Pinecone index: {str(e)}")
+                        return None, None
         except Exception as e:
             logger.error(f"Error checking Pinecone indexes: {str(e)}")
             st.error(f"Error checking Pinecone indexes: {str(e)}")
@@ -246,19 +274,33 @@ def create_and_store_embeddings(docs, video_title):
 
         # Initialize Pinecone Vector Store with LangChain
         with st.spinner("Creating and storing embeddings..."):
-            # Use LangChain's Pinecone integration with updated approach
+            # Use LangChain's Pinecone integration with version-aware approach
             try:
-                # Get the index directly using updated API
-                index = pinecone.Index(PINECONE_INDEX_NAME)
+                # Get the index with version-aware code
+                pinecone_version = pinecone.__version__.split('.')[0]
+                
+                if int(pinecone_version) >= 4:
+                    # Pinecone v4+ API
+                    index = pc.Index(PINECONE_INDEX_NAME)
+                    
+                    # Delete existing vectors in this namespace to avoid conflicts
+                    try:
+                        index.delete(namespace=video_namespace, delete_all=True)
+                        logger.info(f"Deleted existing vectors in namespace: {video_namespace}")
+                    except Exception as e:
+                        logger.warning(f"No existing vectors to delete in namespace {video_namespace}: {str(e)}")
+                else:
+                    # Legacy Pinecone v2-v3 API
+                    index = pc.Index(PINECONE_INDEX_NAME)
+                    
+                    # Delete existing vectors in this namespace to avoid conflicts
+                    try:
+                        index.delete(deleteAll=True, namespace=video_namespace)
+                        logger.info(f"Deleted existing vectors in namespace: {video_namespace}")
+                    except Exception as e:
+                        logger.warning(f"No existing vectors to delete in namespace {video_namespace}: {str(e)}")
 
-                # Delete existing vectors in this namespace to avoid conflicts
-                try:
-                    index.delete(namespace=video_namespace, delete_all=True)
-                    logger.info(f"Deleted existing vectors in namespace: {video_namespace}")
-                except Exception as e:
-                    logger.warning(f"No existing vectors to delete in namespace {video_namespace}: {str(e)}")
-
-                # Use updated from_documents signature
+                # Create vector store with LangChain - compatible with both v3 and v4
                 vector_store = PineconeVectorStore.from_documents(
                     documents=docs,
                     embedding=embeddings,
@@ -483,21 +525,35 @@ if hasattr(st.session_state, 'conversation') and st.session_state.conversation:
 # Debug panel
 if debug_mode:
     st.sidebar.header("Debug Information")
+    st.sidebar.subheader("Pinecone Version")
+    st.sidebar.write(f"Pinecone SDK Version: {pinecone.__version__}")
 
     if hasattr(st.session_state, 'vector_store') and st.session_state.vector_store:
         st.sidebar.subheader("Vector Store Info")
         st.sidebar.write(f"Index Name: {PINECONE_INDEX_NAME}")
         st.sidebar.write(f"Namespace: {st.session_state.video_namespace}")
 
-        # Try to get namespace stats
+        # Try to get namespace stats - version aware
         try:
-            index = pc.Index(PINECONE_INDEX_NAME)
-            stats = index.describe_index_stats()
-            if st.session_state.video_namespace in stats.get('namespaces', {}):
-                vector_count = stats['namespaces'][st.session_state.video_namespace]['vector_count']
-                st.sidebar.write(f"Vector Count: {vector_count}")
+            pinecone_version = pinecone.__version__.split('.')[0]
+            if int(pinecone_version) >= 4:
+                # Pinecone v4+ API
+                index = pc.Index(PINECONE_INDEX_NAME)
+                stats = index.describe_index_stats()
+                if st.session_state.video_namespace in stats.get('namespaces', {}):
+                    vector_count = stats['namespaces'][st.session_state.video_namespace]['vector_count']
+                    st.sidebar.write(f"Vector Count: {vector_count}")
+                else:
+                    st.sidebar.warning(f"Namespace {st.session_state.video_namespace} not found in index stats")
             else:
-                st.sidebar.warning(f"Namespace {st.session_state.video_namespace} not found in index stats")
+                # Legacy Pinecone v2-v3 API
+                index = pc.Index(PINECONE_INDEX_NAME)
+                stats = index.describe_index_stats()
+                if st.session_state.video_namespace in stats.get('namespaces', {}):
+                    vector_count = stats['namespaces'][st.session_state.video_namespace]['vector_count']
+                    st.sidebar.write(f"Vector Count: {vector_count}")
+                else:
+                    st.sidebar.warning(f"Namespace {st.session_state.video_namespace} not found in index stats")
         except Exception as e:
             st.sidebar.error(f"Error getting index stats: {str(e)}")
 
