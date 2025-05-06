@@ -27,7 +27,7 @@ from langchain.memory import ConversationBufferMemory
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.callbacks import StdOutCallbackHandler
 
-# Initialize Pinecone with the v3.x client
+# Initialize Pinecone with the updated client
 from pinecone import Pinecone
 from langchain_pinecone import PineconeVectorStore
 
@@ -61,15 +61,14 @@ if 'chat_history' not in st.session_state:
 # Load API keys from Streamlit secrets
 try:
     PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
+    PINECONE_ENVIRONMENT = st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter")  # Provide a default
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
-    # Initialize Pinecone client with the v3.x API key
+    # Initialize Pinecone client with the API key
     pc = Pinecone(api_key=PINECONE_API_KEY)
-    logger.info("Pinecone client initialized with v3.x syntax")
 except Exception as e:
     st.error(f"Error loading API keys: {str(e)}")
-    st.error("Please make sure you have set up your API keys in the Streamlit Cloud dashboard.")
-    logger.error(f"Error loading API keys: {str(e)}")
+    st.error("Please make sure you have set up your .streamlit/secrets.toml file with the required API keys.")
     st.stop()
 
 # Pinecone specific configuration
@@ -225,24 +224,15 @@ def create_and_store_embeddings(docs, video_title):
 
         # Check if Pinecone index exists, create if not
         try:
-            # Using v3.x syntax to list indexes
-            indexes = pc.list_indexes()
-            index_names = [index.name for index in indexes]
-            
+            index_names = [index for index in pc.list_indexes().names()]
             if PINECONE_INDEX_NAME not in index_names:
                 st.warning(f"Index '{PINECONE_INDEX_NAME}' not found. Creating a new index...")
                 try:
-                    # Create a new index with v3.x syntax
+                    # Create a new index with the updated SDK
                     pc.create_index(
                         name=PINECONE_INDEX_NAME,
                         dimension=384,  # Dimension for all-MiniLM-L6-v2
-                        metric="cosine",
-                        spec={
-                            "serverless": {
-                                "cloud": "aws",
-                                "region": "us-west-2"  # Choose an appropriate region
-                            }
-                        }
+                        metric="cosine"
                     )
                     st.success(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
                 except Exception as e:
@@ -256,34 +246,43 @@ def create_and_store_embeddings(docs, video_title):
 
         # Initialize Pinecone Vector Store with LangChain
         with st.spinner("Creating and storing embeddings..."):
-            # Use LangChain's Pinecone integration with v3.x approach
+            # Use LangChain's Pinecone integration with updated approach
             try:
-                # Get the index with v3.x syntax
+                # Get the index directly using updated API
                 index = pc.Index(PINECONE_INDEX_NAME)
 
                 # Delete existing vectors in this namespace to avoid conflicts
                 try:
-                    # v3.x syntax for deleting
                     index.delete(namespace=video_namespace, delete_all=True)
                     logger.info(f"Deleted existing vectors in namespace: {video_namespace}")
                 except Exception as e:
                     logger.warning(f"No existing vectors to delete in namespace {video_namespace}: {str(e)}")
 
-                # Use langchain_pinecone with v3.x compatibility
+                # Use updated from_documents signature
                 vector_store = PineconeVectorStore.from_documents(
                     documents=docs,
                     embedding=embeddings,
                     index_name=PINECONE_INDEX_NAME,
-                    namespace=video_namespace,
-                    pinecone_client=pc  # Pass the v3.x client directly
+                    namespace=video_namespace
                 )
                 logger.info(f"Successfully stored {len(docs)} document chunks in Pinecone")
-                
-                return vector_store, video_namespace
             except Exception as e:
-                logger.error(f"Error storing embeddings: {str(e)}")
-                st.error(f"Error storing embeddings: {str(e)}")
-                return None, None
+                logger.error(f"First attempt to store embeddings failed: {str(e)}")
+                try:
+                    # Alternative approach passing index directly
+                    vector_store = PineconeVectorStore.from_documents(
+                        documents=docs,
+                        embedding=embeddings,
+                        index=index,  # Use the index directly
+                        namespace=video_namespace
+                    )
+                    logger.info(f"Successfully stored {len(docs)} document chunks in Pinecone (alternative method)")
+                except Exception as e2:
+                    logger.error(f"Both attempts to store embeddings failed: {str(e2)}")
+                    st.error(f"Error storing embeddings: {str(e2)}")
+                    return None, None
+
+        return vector_store, video_namespace
     except Exception as e:
         logger.error(f"Error in create_and_store_embeddings: {str(e)}")
         st.error(f"Error storing embeddings: {str(e)}")
@@ -490,10 +489,9 @@ if debug_mode:
         st.sidebar.write(f"Index Name: {PINECONE_INDEX_NAME}")
         st.sidebar.write(f"Namespace: {st.session_state.video_namespace}")
 
-        # Try to get namespace stats with v3.x syntax
+        # Try to get namespace stats
         try:
             index = pc.Index(PINECONE_INDEX_NAME)
-            # v3.x style stats 
             stats = index.describe_index_stats()
             if st.session_state.video_namespace in stats.get('namespaces', {}):
                 vector_count = stats['namespaces'][st.session_state.video_namespace]['vector_count']
@@ -521,15 +519,16 @@ with st.sidebar.expander("How to set up API keys"):
     Create a `.streamlit` directory in your project folder and add a `secrets.toml` file with:
 
     ```toml
-    # Required API keys
-    PINECONE_API_KEY = "your-pinecone-api-key"
-    GOOGLE_API_KEY = "your-google-api-key"
-    ```
+        # Required API keys
+        PINECONE_API_KEY = "your-pinecone-api-key"
+        PINECONE_ENVIRONMENT = "gcp-starter"  # Or your environment
+        GOOGLE_API_KEY = "your-google-api-key"
+        ```
 
-    Get your API keys from:
-    - [Pinecone Console](https://app.pinecone.io)
-    - [Google AI Studio](https://makersuite.google.com/app/apikey)
-    """)
+        Get your API keys from:
+        - [Pinecone Console](https://app.pinecone.io)
+        - [Google AI Studio](https://makersuite.google.com/app/apikey)
+        """)
 
 # Footer
 st.markdown("---")
