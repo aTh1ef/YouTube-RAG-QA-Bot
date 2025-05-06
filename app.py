@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import os
 import requests
@@ -27,8 +26,8 @@ from langchain.memory import ConversationBufferMemory
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.callbacks import StdOutCallbackHandler
 
-# Initialize Pinecone with the updated client
-from pinecone import Pinecone
+# Initialize Pinecone with the updated client - NEW API
+from pinecone import Pinecone, ServerlessSpec
 from langchain_pinecone import PineconeVectorStore
 
 # YouTube Transcript API for getting transcripts directly
@@ -64,7 +63,7 @@ try:
     PINECONE_ENVIRONMENT = st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter")  # Provide a default
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
-    # Initialize Pinecone client with the API key
+    # Initialize Pinecone client with the API key - NEW API
     pc = Pinecone(api_key=PINECONE_API_KEY)
 except Exception as e:
     st.error(f"Error loading API keys: {str(e)}")
@@ -224,15 +223,19 @@ def create_and_store_embeddings(docs, video_title):
 
         # Check if Pinecone index exists, create if not
         try:
-            index_names = [index for index in pc.list_indexes().names()]
+            # NEW API: List indexes
+            index_list = pc.list_indexes()
+            index_names = [index.name for index in index_list]
+            
             if PINECONE_INDEX_NAME not in index_names:
                 st.warning(f"Index '{PINECONE_INDEX_NAME}' not found. Creating a new index...")
                 try:
-                    # Create a new index with the updated SDK
+                    # NEW API: Create a new index
                     pc.create_index(
                         name=PINECONE_INDEX_NAME,
                         dimension=384,  # Dimension for all-MiniLM-L6-v2
-                        metric="cosine"
+                        metric="cosine",
+                        spec=ServerlessSpec(cloud="aws", region="us-west-2")  # Adjust as needed
                     )
                     st.success(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
                 except Exception as e:
@@ -248,12 +251,16 @@ def create_and_store_embeddings(docs, video_title):
         with st.spinner("Creating and storing embeddings..."):
             # Use LangChain's Pinecone integration with updated approach
             try:
-                # Get the index directly using updated API
+                # NEW API: Get the index
                 index = pc.Index(PINECONE_INDEX_NAME)
 
                 # Delete existing vectors in this namespace to avoid conflicts
                 try:
-                    index.delete(namespace=video_namespace, delete_all=True)
+                    # NEW API: Delete all vectors in namespace
+                    index.delete(
+                        namespace=video_namespace,
+                        filter={}  # Empty filter deletes all
+                    )
                     logger.info(f"Deleted existing vectors in namespace: {video_namespace}")
                 except Exception as e:
                     logger.warning(f"No existing vectors to delete in namespace {video_namespace}: {str(e)}")
@@ -491,6 +498,7 @@ if debug_mode:
 
         # Try to get namespace stats
         try:
+            # NEW API: Get index stats
             index = pc.Index(PINECONE_INDEX_NAME)
             stats = index.describe_index_stats()
             if st.session_state.video_namespace in stats.get('namespaces', {}):
@@ -519,10 +527,10 @@ with st.sidebar.expander("How to set up API keys"):
     Create a `.streamlit` directory in your project folder and add a `secrets.toml` file with:
 
     ```toml
-        # Required API keys
-        PINECONE_API_KEY = "your-pinecone-api-key"
-        PINECONE_ENVIRONMENT = "gcp-starter"  # Or your environment
-        GOOGLE_API_KEY = "your-google-api-key"
+    # Required API keys
+    PINECONE_API_KEY = "your-pinecone-api-key"
+    PINECONE_ENVIRONMENT = "gcp-starter"  # Or your environment
+    GOOGLE_API_KEY = "your-google-api-key"
         ```
 
         Get your API keys from:
