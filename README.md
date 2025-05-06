@@ -4,7 +4,7 @@ A conversational AI application that lets users ask questions about YouTube vide
 
 🌐 Live Demo
 Try out the live demo of this application at:
-https://ai-pdf-langchain-chatbot-app.streamlit.app/
+[https://ai-pdf-langchain-chatbot-app.streamlit.app/](https://youtube-rag-ai-bot.streamlit.app/)
 
 ![YouTube RAG Assistant Banner](https://img.shields.io/badge/YouTube-RAG%20Assistant-red?style=for-the-badge&logo=youtube)
 
