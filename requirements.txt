@@ -2,7 +2,6 @@
 streamlit
 yt-dlp
 google-generativeai
-pinecone>=3.0.0
 sentence-transformers
 torch
 tqdm
@@ -17,3 +16,6 @@ langchain-community
 langchain_huggingface
 youtube-transcript-api
 protobuf
+pinecone==6.0.2
+pinecone-client==6.0.0
+pinecone-plugin-interface==0.0.7
