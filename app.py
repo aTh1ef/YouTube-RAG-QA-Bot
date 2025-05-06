@@ -28,7 +28,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.callbacks import StdOutCallbackHandler
 
 # Initialize Pinecone with the updated client
-import pinecone
+from pinecone import Pinecone  
 from langchain_pinecone import PineconeVectorStore
 
 # YouTube Transcript API for getting transcripts directly
@@ -65,7 +65,7 @@ try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
     # Initialize Pinecone client with the API key
-    pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+    pinecone.init(api_key=PINECONE_API_KEY)
 except Exception as e:
     st.error(f"Error loading API keys: {str(e)}")
     st.error("Please make sure you have set up your .streamlit/secrets.toml file with the required API keys.")
