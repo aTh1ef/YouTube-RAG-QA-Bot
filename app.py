@@ -27,8 +27,8 @@ from langchain.memory import ConversationBufferMemory
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.callbacks import StdOutCallbackHandler
 
-# Initialize Pinecone with the updated client
-from pinecone import Pinecone
+# Initialize Pinecone with the compatible client (v2.x)
+import pinecone  # Using v2.x syntax
 from langchain_pinecone import PineconeVectorStore
 
 # YouTube Transcript API for getting transcripts directly
@@ -64,8 +64,8 @@ try:
     PINECONE_ENVIRONMENT = st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter")  # Provide a default
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
-    # Initialize Pinecone client with the API key
-    pc = Pinecone(api_key=PINECONE_API_KEY)
+    # Initialize Pinecone client with the API key (v2.x syntax)
+    pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
 except Exception as e:
     st.error(f"Error loading API keys: {str(e)}")
     st.error("Please make sure you have set up your .streamlit/secrets.toml file with the required API keys.")
@@ -224,12 +224,12 @@ def create_and_store_embeddings(docs, video_title):
 
         # Check if Pinecone index exists, create if not
         try:
-            index_names = [index for index in pc.list_indexes().names()]
+            index_names = pinecone.list_indexes()  # v2.x syntax
             if PINECONE_INDEX_NAME not in index_names:
                 st.warning(f"Index '{PINECONE_INDEX_NAME}' not found. Creating a new index...")
                 try:
-                    # Create a new index with the updated SDK
-                    pc.create_index(
+                    # Create a new index with v2.x syntax
+                    pinecone.create_index(
                         name=PINECONE_INDEX_NAME,
                         dimension=384,  # Dimension for all-MiniLM-L6-v2
                         metric="cosine"
@@ -246,19 +246,20 @@ def create_and_store_embeddings(docs, video_title):
 
         # Initialize Pinecone Vector Store with LangChain
         with st.spinner("Creating and storing embeddings..."):
-            # Use LangChain's Pinecone integration with updated approach
+            # Use LangChain's Pinecone integration with v2.x approach
             try:
-                # Get the index directly using updated API
-                index = pc.Index(PINECONE_INDEX_NAME)
+                # Get the index using v2.x syntax
+                index = pinecone.Index(PINECONE_INDEX_NAME)
 
                 # Delete existing vectors in this namespace to avoid conflicts
                 try:
-                    index.delete(namespace=video_namespace, delete_all=True)
+                    # v2.x syntax for deleting
+                    index.delete(filter={"namespace": video_namespace}, delete_all=True)
                     logger.info(f"Deleted existing vectors in namespace: {video_namespace}")
                 except Exception as e:
                     logger.warning(f"No existing vectors to delete in namespace {video_namespace}: {str(e)}")
 
-                # Use updated from_documents signature
+                # Use langchain_pinecone with v2.x
                 vector_store = PineconeVectorStore.from_documents(
                     documents=docs,
                     embedding=embeddings,
@@ -266,23 +267,12 @@ def create_and_store_embeddings(docs, video_title):
                     namespace=video_namespace
                 )
                 logger.info(f"Successfully stored {len(docs)} document chunks in Pinecone")
+                
+                return vector_store, video_namespace
             except Exception as e:
-                logger.error(f"First attempt to store embeddings failed: {str(e)}")
-                try:
-                    # Alternative approach passing index directly
-                    vector_store = PineconeVectorStore.from_documents(
-                        documents=docs,
-                        embedding=embeddings,
-                        index=index,  # Use the index directly
-                        namespace=video_namespace
-                    )
-                    logger.info(f"Successfully stored {len(docs)} document chunks in Pinecone (alternative method)")
-                except Exception as e2:
-                    logger.error(f"Both attempts to store embeddings failed: {str(e2)}")
-                    st.error(f"Error storing embeddings: {str(e2)}")
-                    return None, None
-
-        return vector_store, video_namespace
+                logger.error(f"Error storing embeddings: {str(e)}")
+                st.error(f"Error storing embeddings: {str(e)}")
+                return None, None
     except Exception as e:
         logger.error(f"Error in create_and_store_embeddings: {str(e)}")
         st.error(f"Error storing embeddings: {str(e)}")
@@ -489,9 +479,10 @@ if debug_mode:
         st.sidebar.write(f"Index Name: {PINECONE_INDEX_NAME}")
         st.sidebar.write(f"Namespace: {st.session_state.video_namespace}")
 
-        # Try to get namespace stats
+        # Try to get namespace stats with v2.x syntax
         try:
-            index = pc.Index(PINECONE_INDEX_NAME)
+            index = pinecone.Index(PINECONE_INDEX_NAME)
+            # v2.x style stats
             stats = index.describe_index_stats()
             if st.session_state.video_namespace in stats.get('namespaces', {}):
                 vector_count = stats['namespaces'][st.session_state.video_namespace]['vector_count']
