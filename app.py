@@ -1,9 +1,25 @@
 # app.py
-import os
 import streamlit as st
-import tempfile
+import os
+import requests
+import re
 import logging
-from langchain_community.document_loaders import PyMuPDFLoader
+from typing import List, Dict, Any
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("youtube_qa_bot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("youtube_qa_bot")
+
+# LangChain imports
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.chains import ConversationalRetrievalChain
@@ -11,489 +27,569 @@ from langchain.memory import ConversationBufferMemory
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.callbacks import StdOutCallbackHandler
 
-# Fix for LangSmithTracer import error
-try:
-    # Import LangSmith callback handler from the correct location
-    from langchain.callbacks.tracers.langchain import LangChainTracer
-
-    has_langsmith = True
-except ImportError:
-    has_langsmith = False
-
-
-    # Fallback if not available
-    class LangChainTracer:
-        def __init__(self, *args, **kwargs):
-            pass
-
-# Updated Pinecone import for older version compatibility
+# Initialize Pinecone with the updated client
+# Fix for Pinecone version compatibility
 import pinecone
 from langchain_pinecone import PineconeVectorStore
-import google.generativeai as genai
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("langchain_processes.log"),
-        logging.StreamHandler()
-    ]
+# YouTube Transcript API for getting transcripts directly
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import TranscriptsDisabled
+
+# Set page configuration
+st.set_page_config(
+    page_title="YouTube Video Q&A Bot",
+    page_icon="🎬",
+    layout="wide"
 )
 
-logger = logging.getLogger("pdf_chatbot")
+# Initialize session state variables if they don't exist
+if 'transcription' not in st.session_state:
+    st.session_state.transcription = None
+if 'video_title' not in st.session_state:
+    st.session_state.video_title = None
+if 'video_url' not in st.session_state:
+    st.session_state.video_url = None
+if 'vector_store' not in st.session_state:
+    st.session_state.vector_store = None
+if 'video_namespace' not in st.session_state:
+    st.session_state.video_namespace = None
+if 'conversation' not in st.session_state:
+    st.session_state.conversation = None
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
 
+# Load API keys from Streamlit secrets
+try:
+    PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
+    PINECONE_ENVIRONMENT = st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter")  # Provide a default
+    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 
-# Set up environment variables from Streamlit secrets
-def setup_environment():
-    # Set required API keys
-    os.environ["PINECONE_API_KEY"] = st.secrets["PINECONE_API_KEY"]
-    os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
-    
-    # Set Pinecone environment for v2 compatibility
-    if "PINECONE_ENVIRONMENT" in st.secrets:
-        os.environ["PINECONE_ENVIRONMENT"] = st.secrets["PINECONE_ENVIRONMENT"]
-
-    # Set LangSmith variables if they exist in secrets
-    if "LANGCHAIN_API_KEY" in st.secrets:
-        os.environ["LANGCHAIN_API_KEY"] = st.secrets["LANGCHAIN_API_KEY"]
-        os.environ["LANGCHAIN_PROJECT"] = st.secrets.get("LANGCHAIN_PROJECT", "pdf-chatbot")
-        os.environ["LANGCHAIN_TRACING_V2"] = st.secrets.get("LANGCHAIN_TRACING_V2", "true")
-        logger.info("LangSmith tracing enabled")
+    # Initialize Pinecone client with the API key (compatible with both v3 and v4)
+    # Check pinecone version to use appropriate initialization
+    pinecone_version = pinecone.__version__.split('.')[0]
+    if int(pinecone_version) >= 4:
+        # Version 4+ initialization
+        pc = pinecone.Pinecone(api_key=PINECONE_API_KEY)
     else:
-        logger.info("LangSmith tracing not configured")
+        # Legacy initialization (v2-v3)
+        pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
+        pc = pinecone  # For compatibility with rest of the code
+except Exception as e:
+    st.error(f"Error loading API keys: {str(e)}")
+    st.error("Please make sure you have set up your .streamlit/secrets.toml file with the required API keys.")
+    st.stop()
+
+# Pinecone specific configuration
+PINECONE_INDEX_NAME = "youtube-qa-bot"
 
 
-# Initialize environment
-setup_environment()
+# Initialize HuggingFace Embeddings - cached to avoid reinitialization issues
+@st.cache_resource
+def get_embeddings_model():
+    try:
+        # Set environment variable to avoid torch issues with Streamlit
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Initialize Pinecone with legacy v2 approach
-pinecone.init(
-    api_key=os.environ["PINECONE_API_KEY"],
-    environment=os.environ.get("PINECONE_ENVIRONMENT", "gcp-starter")
-)
+        # Using a simpler embedding model with fewer issues
+        return HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            cache_folder=None
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize embeddings model: {str(e)}")
+        st.error(f"Failed to initialize embeddings model: {str(e)}")
+        return None
 
-# Initialize Gemini
-genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
 
-
-class PDFChatbot:
-    def __init__(self):
-        logger.info("Initializing PDF Chatbot")
-
-        # Initialize components first
-        self.embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        self.index_name = "pdf-chatbot"
-
-        # Initialize callbacks list - use proper handlers
-        callbacks = None  # Initially set to None
-
-        # Only set up callbacks if LangSmith is properly configured
-        if "LANGCHAIN_API_KEY" in os.environ and has_langsmith:
-            try:
-                tracer = LangChainTracer(
-                    project_name=os.environ.get("LANGCHAIN_PROJECT", "pdf-chatbot")
-                )
-                callbacks = [StdOutCallbackHandler(), tracer]
-                logger.info("LangSmith tracing enabled with callback handlers")
-            except Exception as e:
-                logger.warning(f"Failed to initialize LangSmith tracing: {e}")
-                callbacks = None
-
-        # Initialize LLM with the updated model name for the free tier
+# Initialize LLM - moved out of function to avoid reinitialization
+@st.cache_resource
+def get_llm():
+    try:
+        return ChatGoogleGenerativeAI(
+            model="gemini-1.5-flash",  # Updated to current model name
+            google_api_key=GOOGLE_API_KEY,
+            temperature=0.2,
+            top_p=0.95,
+            max_output_tokens=2048
+        )
+    except Exception as e:
+        logger.error(f"Error initializing primary LLM: {str(e)}")
         try:
-            # First attempt using the latest model name format for Gemini
-            self.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
-            logger.info("Successfully initialized LLM with gemini-1.5-flash model")
-        except Exception as e:
-            logger.warning(f"Error initializing gemini-1.5-flash: {e}")
-            try:
-                # Fallback to another common model name
-                self.llm = ChatGoogleGenerativeAI(model="gemini-1.0-pro")
-                logger.info("Successfully initialized LLM with gemini-1.0-pro model")
-            except Exception as e2:
-                logger.warning(f"Error initializing gemini-1.0-pro: {e2}")
-                # Final fallback - configure a backup LLM
-                self.llm = ChatGoogleGenerativeAI(model="models/gemini-pro")
-                logger.info("Trying legacy model name format: models/gemini-pro")
+            # Fallback to older model
+            return ChatGoogleGenerativeAI(
+                model="gemini-1.0-pro",
+                google_api_key=GOOGLE_API_KEY,
+                temperature=0.2,
+                top_p=0.95,
+                max_output_tokens=2048
+            )
+        except Exception as e2:
+            logger.error(f"Error initializing fallback LLM: {str(e2)}")
+            st.error(f"Failed to initialize language model: {str(e2)}")
+            return None
+
+
+# Function to extract YouTube video ID from URL
+def extract_video_id(url):
+    # Regular expression patterns for YouTube URLs
+    patterns = [
+        r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/|youtube\.com\/e\/|youtube\.com\/user\/.+\/|youtube\.com\/user\/(?!.+\/)|youtube\.com\/.*[?&]v=|youtube\.com\/.*[?&]vi=)([^#&?\/\s]{11})',
+        r'(?:youtube\.com\/shorts\/|youtube\.com\/live\/)([^#&?\/\s]{11})'
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+
+    return None
+
+
+# Function to get video title from YouTube
+def get_video_title(video_id):
+    try:
+        # Use a simple HTTP request to get the title from HTML (no API key needed)
+        response = requests.get(f"https://www.youtube.com/watch?v={video_id}")
+        if response.status_code == 200:
+            # Extract title from HTML meta tags
+            match = re.search(r'<title>(.+?) - YouTube</title>', response.text)
+            if match:
+                return match.group(1)
+        return f"YouTube Video {video_id}"
+    except Exception as e:
+        logger.warning(f"Could not get video title: {str(e)}")
+        return f"YouTube Video {video_id}"
+
+
+# Function to get transcript directly from YouTube
+def get_youtube_transcript(video_id):
+    try:
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+
+        # Check if the transcript is empty
+        if not transcript_list:
+            st.error("No transcript content available for this video.")
+            return None
+
+        # Combine all transcript parts into a single text
+        full_transcript = " ".join([part["text"] + " " for part in transcript_list])
+
+        # Check if the transcript is empty after cleaning
+        if not full_transcript.strip():
+            st.error("Transcript is empty after processing.")
+            return None
+
+        return full_transcript
+    except TranscriptsDisabled:
+        st.error("Transcripts are disabled for this video.")
+        return None
+    except Exception as e:
+        # Generic exception handling for any other transcript-related errors
+        st.error(f"No transcript available for this video: {str(e)}")
+        return None
+
+
+# Function to split text into documents using LangChain
+def split_text_into_documents(text, video_title):
+    try:
+        # Create a LangChain Document
+        doc = Document(page_content=text, metadata={"source": video_title})
+
+        # Use LangChain's RecursiveCharacterTextSplitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,  # Reduced chunk size for better retrieval
+            chunk_overlap=100,
+            length_function=len,
+        )
+
+        # Split into chunks
+        docs = text_splitter.split_documents([doc])
+
+        # Add metadata to each chunk
+        for i, chunk in enumerate(docs):
+            chunk.metadata["chunk_id"] = i
+            chunk.metadata["video_title"] = video_title
+
+        return docs
+    except Exception as e:
+        logger.error(f"Error splitting text into documents: {str(e)}")
+        st.error(f"Error splitting text into documents: {str(e)}")
+        return []
+
+
+# Function to create embeddings and store in Pinecone using LangChain
+def create_and_store_embeddings(docs, video_title):
+    try:
+        # Generate a unique namespace for this video
+        video_namespace = ''.join(e for e in video_title if e.isalnum()).lower()[:40]
+        video_namespace = video_namespace.replace(" ", "-")
+
+        # Initialize the embedding model
+        embeddings = get_embeddings_model()
+        if embeddings is None:
+            st.error("Failed to initialize embeddings model. Cannot continue.")
+            return None, None
 
         # Check if Pinecone index exists, create if not
         try:
-            index_list = pinecone.list_indexes()
-            if self.index_name not in index_list:
-                logger.info(f"Creating new Pinecone index: {self.index_name}")
-                pinecone.create_index(
-                    name=self.index_name,
-                    dimension=384,  # Dimension for all-MiniLM-L6-v2
-                    metric="cosine"
-                )
-            logger.info(f"Using existing Pinecone index: {self.index_name}")
-        except Exception as e:
-            logger.error(f"Error with Pinecone index setup: {e}")
-            st.error(f"Error with Pinecone index setup: {e}")
-
-        # Initialize conversation memory - updated to address deprecation warning
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer"  # Add this to ensure proper memory retention
-        )
-
-        # Store callbacks for reuse - may be None if initialization failed
-        self.callbacks = callbacks
-
-        logger.info("PDF Chatbot initialization complete")
-
-    def extract_text_from_pdf(self, pdf_file):
-        """Extract text from uploaded PDF file"""
-        logger.info(f"Starting text extraction from PDF: {pdf_file.name}")
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            tmp_file.write(pdf_file.getvalue())
-            pdf_path = tmp_file.name
-
-        logger.info(f"Temporary PDF file created: {pdf_path}")
-
-        try:
-            loader = PyMuPDFLoader(pdf_path)
-            documents = loader.load()
-            logger.info(f"Extracted {len(documents)} pages from PDF")
-        except Exception as e:
-            logger.error(f"Error extracting text from PDF: {str(e)}")
-            st.error(f"Error extracting text: {str(e)}")
-            documents = []
-        finally:
-            # Clean up the temporary file
-            os.unlink(pdf_path)
-            logger.info(f"Temporary PDF file deleted")
-
-        return documents
-
-    def chunk_text(self, documents):
-        """Split text into manageable chunks"""
-        logger.info("Starting text chunking process")
-
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=100
-        )
-        chunks = text_splitter.split_documents(documents)
-
-        logger.info(f"Created {len(chunks)} chunks from documents")
-
-        # Log first chunk as sample
-        if chunks:
-            logger.info(f"Sample chunk content: {chunks[0].page_content[:100]}...")
-
-        return chunks
-
-    def create_embeddings_and_store(self, chunks, namespace):
-        """Create embeddings and store in Pinecone"""
-        logger.info(f"Creating embeddings for {len(chunks)} chunks and storing in Pinecone namespace: {namespace}")
-
-        try:
-            # Get the index using legacy v2 approach
-            index = pinecone.Index(self.index_name)
+            pinecone_version = pinecone.__version__.split('.')[0]
             
-            # Delete any existing vectors in this namespace to avoid conflicts
-            try:
-                index.delete(deleteAll=True, namespace=namespace)
-                logger.info(f"Deleted existing vectors in namespace: {namespace}")
-            except Exception as e:
-                logger.warning(f"No existing vectors to delete or error: {str(e)}")
-                
-            # Create the vector store with legacy approach
-            vectorstore = PineconeVectorStore.from_documents(
-                documents=chunks,
-                embedding=self.embeddings,
-                index_name=self.index_name,
-                namespace=namespace
-            )
-            logger.info("Embeddings created and stored successfully")
-            return vectorstore
+            if int(pinecone_version) >= 4:
+                # Pinecone v4+ API
+                index_names = [idx["name"] for idx in pc.list_indexes()]
+                if PINECONE_INDEX_NAME not in index_names:
+                    st.warning(f"Index '{PINECONE_INDEX_NAME}' not found. Creating a new index...")
+                    try:
+                        pc.create_index(
+                            name=PINECONE_INDEX_NAME,
+                            dimension=384,  # Dimension for all-MiniLM-L6-v2
+                            metric="cosine"
+                        )
+                        st.success(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
+                    except Exception as e:
+                        logger.error(f"Failed to create Pinecone index: {str(e)}")
+                        st.error(f"Failed to create Pinecone index: {str(e)}")
+                        return None, None
+            else:
+                # Legacy Pinecone v2-v3 API
+                index_names = pc.list_indexes()
+                if PINECONE_INDEX_NAME not in index_names:
+                    st.warning(f"Index '{PINECONE_INDEX_NAME}' not found. Creating a new index...")
+                    try:
+                        pc.create_index(
+                            name=PINECONE_INDEX_NAME,
+                            dimension=384,  # Dimension for all-MiniLM-L6-v2
+                            metric="cosine"
+                        )
+                        st.success(f"Created new Pinecone index: {PINECONE_INDEX_NAME}")
+                    except Exception as e:
+                        logger.error(f"Failed to create Pinecone index: {str(e)}")
+                        st.error(f"Failed to create Pinecone index: {str(e)}")
+                        return None, None
         except Exception as e:
-            logger.error(f"Error creating embeddings: {str(e)}")
-            st.error(f"Error creating embeddings: {str(e)}")
-            raise e
+            logger.error(f"Error checking Pinecone indexes: {str(e)}")
+            st.error(f"Error checking Pinecone indexes: {str(e)}")
+            return None, None
 
-    def get_conversational_chain(self, vectorstore):
-        """Create a conversational chain for Q&A"""
-        logger.info("Creating conversational retrieval chain")
+        # Initialize Pinecone Vector Store with LangChain
+        with st.spinner("Creating and storing embeddings..."):
+            # Use LangChain's Pinecone integration with version-aware approach
+            try:
+                # Get the index with version-aware code
+                pinecone_version = pinecone.__version__.split('.')[0]
+                
+                if int(pinecone_version) >= 4:
+                    # Pinecone v4+ API
+                    index = pc.Index(PINECONE_INDEX_NAME)
+                    
+                    # Delete existing vectors in this namespace to avoid conflicts
+                    try:
+                        index.delete(namespace=video_namespace, delete_all=True)
+                        logger.info(f"Deleted existing vectors in namespace: {video_namespace}")
+                    except Exception as e:
+                        logger.warning(f"No existing vectors to delete in namespace {video_namespace}: {str(e)}")
+                else:
+                    # Legacy Pinecone v2-v3 API
+                    index = pc.Index(PINECONE_INDEX_NAME)
+                    
+                    # Delete existing vectors in this namespace to avoid conflicts
+                    try:
+                        index.delete(deleteAll=True, namespace=video_namespace)
+                        logger.info(f"Deleted existing vectors in namespace: {video_namespace}")
+                    except Exception as e:
+                        logger.warning(f"No existing vectors to delete in namespace {video_namespace}: {str(e)}")
 
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+                # Create vector store with LangChain - compatible with both v3 and v4
+                vector_store = PineconeVectorStore.from_documents(
+                    documents=docs,
+                    embedding=embeddings,
+                    index_name=PINECONE_INDEX_NAME,
+                    namespace=video_namespace
+                )
+                logger.info(f"Successfully stored {len(docs)} document chunks in Pinecone")
+            except Exception as e:
+                logger.error(f"First attempt to store embeddings failed: {str(e)}")
+                try:
+                    # Alternative approach passing index directly
+                    vector_store = PineconeVectorStore.from_documents(
+                        documents=docs,
+                        embedding=embeddings,
+                        index=index,  # Use the index directly
+                        namespace=video_namespace
+                    )
+                    logger.info(f"Successfully stored {len(docs)} document chunks in Pinecone (alternative method)")
+                except Exception as e2:
+                    logger.error(f"Both attempts to store embeddings failed: {str(e2)}")
+                    st.error(f"Error storing embeddings: {str(e2)}")
+                    return None, None
 
-        chain = ConversationalRetrievalChain.from_llm(
-            llm=self.llm,
+        return vector_store, video_namespace
+    except Exception as e:
+        logger.error(f"Error in create_and_store_embeddings: {str(e)}")
+        st.error(f"Error storing embeddings: {str(e)}")
+        return None, None
+
+
+# Create a conversation memory
+def setup_memory():
+    return ConversationBufferMemory(
+        memory_key="chat_history",
+        return_messages=True,
+        output_key="answer"  # Ensure this matches with chain's output_key
+    )
+
+
+# Create a retrieval-based conversation chain using LangChain
+def setup_qa_chain(vector_store):
+    try:
+        # Get the retriever from vector store with increased k
+        retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+
+        # Initialize the LLM
+        llm = get_llm()
+        if llm is None:
+            st.error("Failed to initialize language model. Cannot continue.")
+            return None
+
+        # Initialize memory
+        memory = setup_memory()
+
+        # Create the Conversational QA chain with system prompt
+        qa_chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
             retriever=retriever,
-            memory=self.memory,
+            memory=memory,
             return_source_documents=True,
-            output_key="answer"  # Important to match with memory's output_key
+            verbose=True
         )
 
-        logger.info("Conversational retrieval chain created")
-        return chain
-
-    def process_query(self, chain, query):
-        """Process a user query and return a response"""
-        logger.info(f"Processing query: {query}")
-
-        result = chain({"question": query})
-
-        logger.info(f"Retrieved {len(result['source_documents'])} source documents")
-        logger.info(f"Generated answer (first 100 chars): {result['answer'][:100]}...")
-
-        return result["answer"], result["source_documents"]
-
-
-# Streamlit UI
-st.set_page_config(page_title="AI PDF Chatbot", layout="wide")
-st.title("AI PDF Chatbot")
-st.write("Upload a PDF and chat with it!")
-
-# Initialize session state
-if "chatbot" not in st.session_state:
-    # Use try/except to handle possible runtime errors during initialization
-    try:
-        st.session_state.chatbot = PDFChatbot()
+        return qa_chain
     except Exception as e:
-        st.error(f"Error initializing chatbot: {str(e)}")
-        st.session_state.chatbot = None
+        logger.error(f"Error setting up QA chain: {str(e)}")
+        st.error(f"Error setting up QA chain: {str(e)}")
+        return None
 
-if "conversation" not in st.session_state:
-    st.session_state.conversation = None
-if "document_processed" not in st.session_state:
-    st.session_state.document_processed = False
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
 
-# Define the layout
-left_col, right_col = st.columns([1, 2])
+# Function to process a user query
+def process_query(query, qa_chain):
+    try:
+        with st.spinner("Searching for answer..."):
+            # Use the updated invoke method instead of __call__
+            result = qa_chain.invoke({"question": query})
 
-# Sidebar content
-with left_col:
-    st.header("Upload Document")
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+            # Extract the answer and source documents
+            answer = result.get("answer", "Sorry, I couldn't find an answer in the transcript.")
+            source_docs = result.get("source_documents", [])
 
-    # Add a debug mode toggle
-    debug_mode = st.toggle("Debug Mode", value=False)
+            # Log retrieval results
+            logger.info(f"Retrieved {len(source_docs)} source documents for query: {query}")
 
-    if "LANGCHAIN_API_KEY" in st.secrets:
-        langsmith_url = "https://smith.langchain.com/projects/" + st.secrets.get("LANGCHAIN_PROJECT", "pdf-chatbot")
-        st.markdown(f"[View Traces in LangSmith]({langsmith_url})")
-
-    if uploaded_file and not st.session_state.document_processed and st.session_state.chatbot:
-        with st.spinner("Processing document..."):
-            # Create a status container
-            status_container = st.empty()
-
-            try:
-                # Extract text from PDF
-                status_container.info("Extracting text from PDF...")
-                documents = st.session_state.chatbot.extract_text_from_pdf(uploaded_file)
-
-                if not documents:
-                    status_container.error("Failed to extract text from PDF. Please try another file.")
-                else:
-                    status_container.success(f"✅ Extracted {len(documents)} pages from PDF")
-
-                    # Chunk text
-                    status_container.info("Chunking text...")
-                    chunks = st.session_state.chatbot.chunk_text(documents)
-                    status_container.success(f"✅ Created {len(chunks)} text chunks")
-
-                    # Create namespace from filename for organization in Pinecone
-                    namespace = uploaded_file.name.replace(" ", "_").lower()
-
-                    # Create embeddings and store in Pinecone
-                    status_container.info("Creating embeddings and storing in Pinecone...")
-                    vectorstore = st.session_state.chatbot.create_embeddings_and_store(chunks, namespace)
-                    status_container.success("✅ Created embeddings and stored in Pinecone")
-
-                    # Set up conversation chain
-                    status_container.info("Setting up conversation chain...")
-                    st.session_state.conversation = st.session_state.chatbot.get_conversational_chain(vectorstore)
-                    st.session_state.document_processed = True
-                    status_container.empty()
-                    st.success("Document processed successfully!")
-            except Exception as e:
-                logger.error(f"Error processing document: {str(e)}")
-                status_container.error(f"Error processing document: {str(e)}")
-
-    # Display document stats if processed
-    if st.session_state.document_processed:
-        st.subheader("Document Information")
-        st.info(f"Filename: {uploaded_file.name}")
-
-        # Add reset button
-        if st.button("Process Another Document"):
-            st.session_state.document_processed = False
-            st.session_state.conversation = None
-            st.session_state.chat_history = []
-            st.experimental_rerun()
-
-# Chat interface
-with right_col:
-    st.header("Chat with your PDF")
-
-    if not st.session_state.document_processed:
-        st.info("Please upload a PDF document to start chatting.")
-    else:
-        # Display chat history
-        for message in st.session_state.chat_history:
-            if message["role"] == "user":
-                st.chat_message("user").write(message["content"])
+            # Debug information about source documents
+            if source_docs:
+                for i, doc in enumerate(source_docs[:2]):  # Log first 2 docs for debugging
+                    logger.info(f"Source doc {i}: {doc.page_content[:100]}...")
             else:
-                st.chat_message("assistant").write(message["content"])
+                logger.warning("No source documents retrieved!")
+                # Add fallback behavior when no sources are retrieved
+                if "I don't know" in answer or "I couldn't find" in answer or not answer.strip():
+                    answer = "I couldn't find specific information about that in the video transcript. Could you try rephrasing your question or asking about another aspect of the video?"
 
-        # User input
-        user_query = st.chat_input("Ask a question about your document")
+            return answer, source_docs
+    except Exception as e:
+        logger.error(f"Error processing query: {str(e)}")
+        st.error(f"Error processing query: {str(e)}")
+        return f"I encountered an error while processing your query: {str(e)}", []
 
-        if user_query:
-            st.chat_message("user").write(user_query)
 
-            # Add user message to chat history
-            st.session_state.chat_history.append({"role": "user", "content": user_query})
+# Main UI Layout
+st.title("🎬 YouTube Video Q&A Bot")
+st.markdown("Extract insights from YouTube videos by asking questions about their content.")
 
-            # Get response from model
-            with st.spinner("Thinking..."):
-                try:
-                    response, sources = st.session_state.chatbot.process_query(st.session_state.conversation,
-                                                                               user_query)
-                except Exception as e:
-                    logger.error(f"Error processing query: {str(e)}")
-                    response = f"I'm sorry, I encountered an error while processing your query: {str(e)}"
-                    sources = []
+# Add a debug mode toggle
+debug_mode = st.sidebar.toggle("Debug Mode", value=False)
 
-            # Display assistant response
-            st.chat_message("assistant").write(response)
+# Input for YouTube URL
+youtube_url = st.text_input("Enter YouTube URL:", key="url_input")
 
-            # Add assistant message to chat history
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
-
-            # Display sources (optional)
-            if sources:
-                with st.expander("Sources"):
-                    for i, source in enumerate(sources):
-                        st.write(f"Source {i + 1}:")
-                        st.write(source.page_content)
-                        st.write(f"Page: {source.metadata.get('page', 'N/A')}")
-                        st.divider()
-
-# Add a debug panel at the bottom of the page
-if debug_mode:
-    st.header("Debug Information")
-
-    debug_tabs = st.tabs(["LangChain Components", "Process Flow", "Logs", "Pinecone Info"])
-
-    with debug_tabs[0]:
-        st.subheader("Document Loader")
-        st.code("PyMuPDFLoader - Extracts text and metadata from PDF documents")
-
-        st.subheader("Text Splitter")
-        st.code("""
-RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=100
-)
-        """)
-
-        st.subheader("Embedding Model")
-        st.code("HuggingFaceEmbeddings(model_name='sentence-transformers/all-MiniLM-L6-v2')")
-
-        st.subheader("Vector Store")
-        st.code(
-            f"PineconeVectorStore(index_name='{st.session_state.chatbot.index_name if st.session_state.chatbot else 'pdf-chatbot'}')")
-
-        st.subheader("Language Model")
-        model_name = "gemini-1.5-flash (with fallbacks to gemini-1.0-pro or models/gemini-pro)"
-        st.code(f"ChatGoogleGenerativeAI(model='{model_name}')")
-
-        st.subheader("Chain Type")
-        st.code("ConversationalRetrievalChain")
-
-    with debug_tabs[3]:
-        st.subheader("Pinecone Configuration")
+# Process button
+if st.button("Process Video"):
+    if youtube_url:
         try:
-            if st.session_state.chatbot:
-                indexes = pinecone.list_indexes()
-                st.write("Available Indexes:", indexes)
-                st.write("Current Index:", st.session_state.chatbot.index_name)
-                st.write("Environment:", os.environ.get("PINECONE_ENVIRONMENT", "gcp-starter"))
-                # Get pinecone client version
-                st.write("Pinecone Client Version:", pinecone.__version__)
+            # Reset chat history when processing a new video
+            st.session_state.chat_history = []
+
+            # Extract video ID
+            video_id = extract_video_id(youtube_url)
+            if not video_id:
+                st.error("Invalid YouTube URL. Please enter a valid YouTube URL.")
+            else:
+                # Get video title
+                video_title = get_video_title(video_id)
+
+                # Get transcript directly from YouTube
+                with st.spinner("Fetching transcript from YouTube..."):
+                    transcription = get_youtube_transcript(video_id)
+
+                    if transcription:
+                        st.success("Transcript fetched successfully!")
+
+                        # Store in session state
+                        st.session_state.transcription = transcription
+                        st.session_state.video_title = video_title
+                        st.session_state.video_url = youtube_url
+
+                        # Split text into documents
+                        docs = split_text_into_documents(transcription, video_title)
+
+                        if docs:
+                            st.success(f"Split transcript into {len(docs)} chunks")
+
+                            # Create and store embeddings
+                            vector_store, video_namespace = create_and_store_embeddings(docs, video_title)
+                            if vector_store and video_namespace:
+                                st.session_state.vector_store = vector_store
+                                st.session_state.video_namespace = video_namespace
+                                st.success(
+                                    f"Created embeddings and stored in Pinecone index under namespace: {video_namespace}")
+
+                                # Set up QA chain
+                                qa_chain = setup_qa_chain(vector_store)
+                                if qa_chain:
+                                    st.session_state.conversation = qa_chain
+                                    st.success("Ready to answer questions about this video!")
+                                else:
+                                    st.error("Failed to set up QA chain. Please try again.")
+                            else:
+                                st.error("Failed to create vector store. Please try again.")
+                        else:
+                            st.error("Failed to process the transcript into documents.")
+                    else:
+                        st.error("Failed to fetch transcript. Please try another video with available captions.")
         except Exception as e:
-            st.error(f"Error fetching Pinecone indexes: {str(e)}")
+            logger.error(f"Error processing video: {str(e)}")
+            st.error(f"Error: {str(e)}")
+    else:
+        st.warning("Please enter a YouTube URL.")
 
-        st.subheader("Pinecone Information")
-        st.info("""
-        Pinecone Configuration:
-        - Index dimensions: 384
-        - Vector type: Dense
-        - Metric: Cosine
-        - Cloud Provider: AWS
-        - Region: us-east-1
-        - Environment: gcp-starter (default)
-        """)
+# Display video info and transcription if available
+if st.session_state.transcription and st.session_state.video_title:
+    st.header("Video Information")
+    st.subheader(st.session_state.video_title)
+    st.markdown(f"Source: [{st.session_state.video_url}]({st.session_state.video_url})")
 
-    with debug_tabs[1]:
-        st.subheader("PDF Upload Process")
-        st.markdown("""
-        1. **PDF Upload** → User uploads PDF file
-        2. **Text Extraction** → PyMuPDFLoader extracts text and metadata
-        3. **Text Chunking** → RecursiveCharacterTextSplitter creates manageable chunks
-        4. **Embedding Creation** → Each chunk converted to vector representation
-        5. **Vector Storage** → Embeddings stored in Pinecone with namespace
-        """)
+    with st.expander("Show Transcription"):
+        st.write(st.session_state.transcription)
 
-        st.subheader("Query Process")
-        st.markdown("""
-        1. **Query Embedding** → User question converted to embedding
-        2. **Vector Search** → Find similar document chunks in Pinecone
-        3. **Context Retrieval** → Get top 5 most relevant chunks
-        4. **Context + Question** → Combine with conversation history
-        5. **LLM Generation** → Send to Gemini to generate response
-        """)
+# Q&A Section - Chat Interface
+if hasattr(st.session_state, 'conversation') and st.session_state.conversation:
+    st.header("Chat with the Video")
 
-    with debug_tabs[2]:
+    # Display chat history
+    for message in st.session_state.chat_history:
+        if isinstance(message, HumanMessage):
+            st.chat_message("user").write(message.content)
+        else:
+            st.chat_message("assistant").write(message.content)
+
+    # Get user question
+    user_question = st.chat_input("Ask a question about the video...")
+
+    if user_question:
+        # Add user message to chat UI
+        st.chat_message("user").write(user_question)
+
+        # Add to session state history
+        st.session_state.chat_history.append(HumanMessage(content=user_question))
+
+        # Get the answer
+        answer, sources = process_query(user_question, st.session_state.conversation)
+
+        # Display assistant response
+        assistant_message = st.chat_message("assistant")
+        assistant_message.write(answer)
+
+        # Add to session state history
+        st.session_state.chat_history.append(AIMessage(content=answer))
+
+        # Display sources if available
+        if sources:
+            with assistant_message.expander("Sources from transcript"):
+                for i, doc in enumerate(sources):
+                    st.markdown(f"**Source {i + 1}:**")
+                    st.markdown(doc.page_content)
+                    st.markdown("---")
+        elif debug_mode:
+            st.warning("No sources were retrieved for this question.")
+
+# Debug panel
+if debug_mode:
+    st.sidebar.header("Debug Information")
+    st.sidebar.subheader("Pinecone Version")
+    st.sidebar.write(f"Pinecone SDK Version: {pinecone.__version__}")
+
+    if hasattr(st.session_state, 'vector_store') and st.session_state.vector_store:
+        st.sidebar.subheader("Vector Store Info")
+        st.sidebar.write(f"Index Name: {PINECONE_INDEX_NAME}")
+        st.sidebar.write(f"Namespace: {st.session_state.video_namespace}")
+
+        # Try to get namespace stats - version aware
         try:
-            with open("langchain_processes.log", "r") as log_file:
-                logs = log_file.read()
-            st.code(logs)
-        except:
-            st.info("No logs available yet")
+            pinecone_version = pinecone.__version__.split('.')[0]
+            if int(pinecone_version) >= 4:
+                # Pinecone v4+ API
+                index = pc.Index(PINECONE_INDEX_NAME)
+                stats = index.describe_index_stats()
+                if st.session_state.video_namespace in stats.get('namespaces', {}):
+                    vector_count = stats['namespaces'][st.session_state.video_namespace]['vector_count']
+                    st.sidebar.write(f"Vector Count: {vector_count}")
+                else:
+                    st.sidebar.warning(f"Namespace {st.session_state.video_namespace} not found in index stats")
+            else:
+                # Legacy Pinecone v2-v3 API
+                index = pc.Index(PINECONE_INDEX_NAME)
+                stats = index.describe_index_stats()
+                if st.session_state.video_namespace in stats.get('namespaces', {}):
+                    vector_count = stats['namespaces'][st.session_state.video_namespace]['vector_count']
+                    st.sidebar.write(f"Vector Count: {vector_count}")
+                else:
+                    st.sidebar.warning(f"Namespace {st.session_state.video_namespace} not found in index stats")
+        except Exception as e:
+            st.sidebar.error(f"Error getting index stats: {str(e)}")
 
-# Create secrets.toml help
-if not st.session_state.document_processed:
-    with st.expander("How to set up API keys"):
-        st.markdown("""
-        ### Setting up your .streamlit/secrets.toml file
+    # Add log viewer
+    st.sidebar.subheader("Logs")
+    try:
+        with open("youtube_qa_bot.log", "r") as log_file:
+            logs = log_file.readlines()
+            # Show last 10 log lines
+            st.sidebar.code("".join(logs[-10:]))
+    except:
+        st.sidebar.info("No logs available yet")
 
-        Create a `.streamlit` directory in your project folder and add a `secrets.toml` file with the following content:
+# Helper section for API keys setup
+with st.sidebar.expander("How to set up API keys"):
+    st.markdown("""
+    ### Setting up your .streamlit/secrets.toml file
 
-        ```toml
+    Create a `.streamlit` directory in your project folder and add a `secrets.toml` file with:
+
+    ```toml
         # Required API keys
         PINECONE_API_KEY = "your-pinecone-api-key"
+        PINECONE_ENVIRONMENT = "gcp-starter"  # Or your environment
         GOOGLE_API_KEY = "your-google-api-key"
-
-        # Required for Pinecone client v2.x.x
-        PINECONE_ENVIRONMENT = "gcp-starter"  # Or your specific environment
-
-        # Optional LangSmith configuration (for advanced monitoring)
-        LANGCHAIN_API_KEY = "your-langsmith-api-key"
-        LANGCHAIN_PROJECT = "pdf-chatbot"
-        LANGCHAIN_TRACING_V2 = "true"
         ```
 
-        You can get your API keys from:
-        - [Pinecone Console](https://app.pinecone.io) (both API key and environment)
+        Get your API keys from:
+        - [Pinecone Console](https://app.pinecone.io)
         - [Google AI Studio](https://makersuite.google.com/app/apikey)
-        - [LangSmith](https://smith.langchain.com) (optional)
         """)
 
 # Footer
 st.markdown("---")
 st.markdown("""
-<div style="text-align: center; opacity: 0.7; font-size: 0.9rem;">
-    Built with ❤️ using <strong>Streamlit</strong>, <strong>LangChain</strong>, <strong>Pinecone</strong>, and <strong>Google Gemini</strong>
+<div style="display: flex; justify-content: center; align-items: center; gap: 0.5rem; opacity: 0.8;">
+    <p>Built with ❤️ using Streamlit, LangChain, Pinecone, and Google Gemini</p>
 </div>
 """, unsafe_allow_html=True)
