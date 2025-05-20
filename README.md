@@ -4,7 +4,7 @@ A conversational AI application that lets users ask questions about YouTube vide
 
 🌐 Live Demo:
 Try out the live demo of this application at:
-[https://ai-pdf-langchain-chatbot-app.streamlit.app/](https://youtube-rag-ai-bot.streamlit.app)
+[(https://youtube-rag-ai-bot.streamlit.app)](https://youtube-rag-ai-bot.streamlit.app)
 
 
 ## 📋 Features
