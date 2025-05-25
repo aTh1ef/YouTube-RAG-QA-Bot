@@ -197,7 +197,139 @@ def get_youtube_transcript(video_id):
     except Exception as e:
         st.error(f"No transcript available for this video: {str(e)}")
         return None
+        
+def polish_transcript_with_gemini(raw_transcript: str, video_title: str) -> str:
+    """
+    Polish raw YouTube transcript using Gemini to make it context-aware and AI-friendly.
+    """
+    llm = get_llm()
+    if not llm:
+        logger.warning("LLM not available for transcript polishing, using raw transcript")
+        return raw_transcript
+    
+    polishing_prompt = """
+You are an expert transcript editor. Your task is to transform a raw YouTube transcript into a well-structured, context-aware document that preserves ALL original meaning while making it readable and AI-friendly.
 
+VIDEO TITLE: {video_title}
+
+INSTRUCTIONS:
+🔤 1. Structure the Text into Complete Paragraphs
+- Each paragraph should focus on a single idea or topic
+- Avoid mixing unrelated points in the same paragraph  
+- Ensure each paragraph is self-contained and doesn't rely on previous ones to be understood
+
+🔍 2. Clarify Ambiguity
+- Replace vague references like "this," "it," "they," "that thing" with the actual subject or entity
+- Use the video title and context to identify what specific products, people, or concepts are being discussed
+- Ensure the reader can understand the meaning without having to guess what is being discussed
+
+✍️ 3. Correct Language Issues
+- Fix grammar, punctuation, and spelling
+- Remove filler words like "um," "uh," "you know," "like," etc.
+- Turn casual spoken phrases into readable written language
+- Fix incomplete sentences and run-on sentences
+
+🧠 4. Preserve All Meaning
+- Do NOT summarize or shorten the transcript
+- Keep all opinions, data, references, comparisons, and examples intact
+- Keep all numbers, statistics, and factual claims exactly as stated
+- Your goal is clarity and structure, not brevity
+
+🤖 5. Make It AI-Friendly
+- Ensure each paragraph can be processed independently for NLP tasks
+- Avoid splitting sentences or ideas across multiple paragraphs
+- Replace unclear pronouns with specific nouns
+- Clarify technical terms and product names when first mentioned
+
+IMPORTANT: This is for a fact-checking system, so accuracy and clarity are crucial. Every claim and detail must be preserved.
+
+RAW TRANSCRIPT:
+{raw_transcript}
+
+POLISHED TRANSCRIPT:
+"""
+
+    try:
+        # Split large transcripts into smaller chunks to avoid token limits
+        max_chunk_size = 10000  # Adjust based on Gemini's context window
+        
+        if len(raw_transcript) <= max_chunk_size:
+            # Process the entire transcript at once
+            prompt = polishing_prompt.format(
+                video_title=video_title,
+                raw_transcript=raw_transcript
+            )
+            
+            with st.spinner("🔧 Polishing transcript with AI for better context awareness..."):
+                response = llm.invoke(prompt)
+                polished_transcript = response.content.strip()
+                
+                if polished_transcript and len(polished_transcript) > 100:
+                    logger.info(f"Successfully polished transcript: {len(raw_transcript)} -> {len(polished_transcript)} characters")
+                    return polished_transcript
+                else:
+                    logger.warning("Polished transcript too short, using original")
+                    return raw_transcript
+        else:
+            # Process in chunks for very long transcripts
+            chunks = []
+            words = raw_transcript.split()
+            current_chunk = []
+            current_size = 0
+            
+            for word in words:
+                current_chunk.append(word)
+                current_size += len(word) + 1
+                
+                if current_size >= max_chunk_size:
+                    chunks.append(" ".join(current_chunk))
+                    current_chunk = []
+                    current_size = 0
+            
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+            
+            polished_chunks = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i, chunk in enumerate(chunks):
+                status_text.text(f"🔧 Polishing transcript chunk {i+1} of {len(chunks)}...")
+                
+                chunk_prompt = polishing_prompt.format(
+                    video_title=video_title,
+                    raw_transcript=chunk
+                )
+                
+                try:
+                    response = llm.invoke(chunk_prompt)
+                    polished_chunk = response.content.strip()
+                    
+                    if polished_chunk and len(polished_chunk) > 50:
+                        polished_chunks.append(polished_chunk)
+                    else:
+                        polished_chunks.append(chunk)  # Fallback to original
+                        
+                except Exception as e:
+                    logger.warning(f"Error polishing chunk {i}: {str(e)}")
+                    polished_chunks.append(chunk)  # Fallback to original
+                
+                progress_bar.progress((i + 1) / len(chunks))
+                time.sleep(0.5)  # Rate limiting
+            
+            progress_bar.empty()
+            status_text.empty()
+            
+            polished_transcript = "\n\n".join(polished_chunks)
+            logger.info(f"Successfully polished transcript in {len(chunks)} chunks: {len(raw_transcript)} -> {len(polished_transcript)} characters")
+            
+            return polished_transcript
+            
+    except Exception as e:
+        logger.error(f"Error polishing transcript: {str(e)}")
+        st.warning(f"Could not polish transcript: {str(e)}. Using original transcript.")
+        return raw_transcript
+        
 def split_text_into_documents(text, video_title):
     try:
         doc = Document(page_content=text, metadata={"source": video_title})
@@ -718,12 +850,11 @@ with tab1:
     if st.button("Process Video"):
         if youtube_url:
             try:
-                # Reset session state for new video
+                # Reset session state
                 st.session_state.chat_history = []
                 st.session_state.extracted_claims = []
                 st.session_state.fact_check_results = []
                 
-                # Extract video ID
                 video_id = extract_video_id(youtube_url)
                 if not video_id:
                     st.error("Invalid YouTube URL. Please enter a valid YouTube URL.")
@@ -731,49 +862,54 @@ with tab1:
                     # Get video title
                     video_title = get_video_title(video_id)
 
-                    # Get transcript directly from YouTube
+                    # Get raw transcript
                     with st.spinner("Fetching transcript from YouTube..."):
-                        transcription = get_youtube_transcript(video_id)
+                        raw_transcription = get_youtube_transcript(video_id)
+                        st.session_state.raw_transcription = raw_transcription
 
-                        if transcription:
-                            st.success("Transcript fetched successfully!")
+                        if raw_transcription:
+                            st.success("✅ Raw transcript fetched successfully!")
 
-                            # Store in session state
-                            st.session_state.transcription = transcription
-                            st.session_state.video_title = video_title
-                            st.session_state.video_url = youtube_url
+                            # Polish the transcript
+                            with st.spinner("🔧 Enhancing transcript quality with AI..."):
+                                polished_transcript = polish_transcript_with_gemini(raw_transcription, video_title)
+                                if polished_transcript:
+                                    st.success("✨ Transcript polished successfully!")
+                                    
+                                    # Store both versions in session state
+                                    st.session_state.transcription = polished_transcript
+                                    st.session_state.video_title = video_title
+                                    st.session_state.video_url = youtube_url
 
-                            # Split text into documents
-                            docs = split_text_into_documents(transcription, video_title)
+                                    # Create document chunks from POLISHED transcript
+                                    with st.spinner("📄 Creating document chunks..."):
+                                        docs = split_text_into_documents(polished_transcript, video_title)
+                                        if docs:
+                                            st.success(f"Split transcript into {len(docs)} chunks")
 
-                            if docs:
-                                st.success(f"Split transcript into {len(docs)} chunks")
-
-                                # Create and store embeddings
-                                vector_store, video_namespace = create_and_store_embeddings(docs, video_title)
-                                if vector_store and video_namespace:
-                                    st.session_state.vector_store = vector_store
-                                    st.session_state.video_namespace = video_namespace
-                                    st.success(f"Created embeddings and stored in Pinecone index under namespace: {video_namespace}")
-
-                                    # Set up QA chain
-                                    qa_chain = setup_qa_chain(vector_store)
-                                    if qa_chain:
-                                        st.session_state.conversation = qa_chain
-                                        st.success("✅ Ready to answer questions about this video!")
-                                        
-                                        # Store docs for fact-checking
-                                        st.session_state.transcript_docs = docs
-                                        
-                                        st.info("💡 You can now switch to the Q&A tab to ask questions or the Fact Check tab to verify claims!")
-                                    else:
-                                        st.error("Failed to set up QA chain. Please try again.")
+                                            # Create and store embeddings from polished chunks
+                                            vector_store, video_namespace = create_and_store_embeddings(docs, video_title)
+                                            if vector_store and video_namespace:
+                                                st.session_state.vector_store = vector_store
+                                                st.session_state.video_namespace = video_namespace
+                                                st.session_state.transcript_docs = docs
+                                                
+                                                # Set up QA chain with polished content
+                                                qa_chain = setup_qa_chain(vector_store)
+                                                if qa_chain:
+                                                    st.session_state.conversation = qa_chain
+                                                    st.success("🎉 Processing complete! Ready for Q&A and fact-checking.")
+                                                else:
+                                                    st.error("Failed to set up QA chain.")
+                                            else:
+                                                st.error("Failed to create vector store.")
+                                        else:
+                                            st.error("Failed to process transcript into documents.")
                                 else:
-                                    st.error("Failed to create vector store. Please try again.")
-                            else:
-                                st.error("Failed to process the transcript into documents.")
+                                    st.error("Failed to polish transcript.")
                         else:
                             st.error("Failed to fetch transcript. Please try another video with available captions.")
+
             except Exception as e:
                 logger.error(f"Error processing video: {str(e)}")
                 st.error(f"Error: {str(e)}")
