@@ -46,7 +46,10 @@ from langchain_pinecone import PineconeVectorStore
 
 # YouTube Transcript API
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled
+from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
+from youtube_transcript_api.formatters import TextFormatter
+import random
+from requests.exceptions import RequestException
 
 # Data classes for fact-checking
 @dataclass
@@ -167,6 +170,80 @@ def get_llm():
             st.error(f"Failed to initialize language model: {str(e2)}")
             return None
 
+# Add these at the top with other constants
+PROXY_LIST = [
+    None,  # Try without proxy first
+    'http://proxy1.example.com:8080',  # Replace with actual proxies
+    'http://proxy2.example.com:8080',
+    'http://proxy3.example.com:8080'
+]
+
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
+
+def get_youtube_transcript(video_id):
+    """
+    Get transcript with proxy support and retry mechanism.
+    """
+    formatter = TextFormatter()
+    last_error = None
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            # Randomly select a proxy (None means no proxy)
+            current_proxy = random.choice(PROXY_LIST)
+            
+            if current_proxy:
+                st.info(f"Attempt {attempt + 1}/{MAX_RETRIES}: Using proxy to fetch transcript...")
+                proxies = {
+                    'http': current_proxy,
+                    'https': current_proxy
+                }
+                transcript_list = YouTubeTranscriptApi.get_transcript(
+                    video_id,
+                    proxies=proxies
+                )
+            else:
+                st.info(f"Attempt {attempt + 1}/{MAX_RETRIES}: Fetching transcript directly...")
+                transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+
+            if not transcript_list:
+                st.warning("No transcript content available for this video.")
+                return None
+
+            # Format transcript
+            formatted_transcript = formatter.format_transcript(transcript_list)
+            if not formatted_transcript.strip():
+                st.warning("Transcript is empty after processing.")
+                return None
+
+            return formatted_transcript
+
+        except (TranscriptsDisabled, NoTranscriptFound) as e:
+            st.error("Transcripts are disabled or not available for this video.")
+            return None
+            
+        except Exception as e:
+            last_error = str(e)
+            if "too many requests" in last_error.lower() or "blocked" in last_error.lower():
+                # If this is not the last attempt, wait and try again
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_DELAY * (attempt + 1)  # Exponential backoff
+                    st.warning(f"YouTube API rate limit hit. Waiting {delay} seconds before retrying...")
+                    time.sleep(delay)
+                    continue
+            else:
+                # For other errors, log and continue retrying
+                logger.warning(f"Error fetching transcript (attempt {attempt + 1}): {str(e)}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                    continue
+
+    # If we get here, all retries failed
+    st.error(f"Failed to fetch transcript after {MAX_RETRIES} attempts. Last error: {last_error}")
+    logger.error(f"All transcript fetch attempts failed. Last error: {last_error}")
+    return None
+
 # Existing functions (extract_video_id, get_video_title, get_youtube_transcript, etc.)
 def extract_video_id(url):
     patterns = [
@@ -191,24 +268,6 @@ def get_video_title(video_id):
         logger.warning(f"Could not get video title: {str(e)}")
         return f"YouTube Video {video_id}"
 
-def get_youtube_transcript(video_id):
-    try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        if not transcript_list:
-            st.error("No transcript content available for this video.")
-            return None
-        full_transcript = " ".join([part["text"] + " " for part in transcript_list])
-        if not full_transcript.strip():
-            st.error("Transcript is empty after processing.")
-            return None
-        return full_transcript
-    except TranscriptsDisabled:
-        st.error("Transcripts are disabled for this video.")
-        return None
-    except Exception as e:
-        st.error(f"No transcript available for this video: {str(e)}")
-        return None
-        
 def polish_transcript_with_gemini(raw_transcript: str, video_title: str) -> str:
     """
     Polish raw YouTube transcript using Gemini to make it context-aware and AI-friendly.
