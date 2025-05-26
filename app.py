@@ -46,10 +46,7 @@ from langchain_pinecone import PineconeVectorStore
 
 # YouTube Transcript API
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
-from youtube_transcript_api.formatters import TextFormatter
-import random
-from requests.exceptions import RequestException
+from youtube_transcript_api._errors import TranscriptsDisabled
 
 # Data classes for fact-checking
 @dataclass
@@ -170,80 +167,6 @@ def get_llm():
             st.error(f"Failed to initialize language model: {str(e2)}")
             return None
 
-# Add these at the top with other constants
-PROXY_LIST = [
-    None,  # Try without proxy first
-    'http://proxy1.example.com:8080',  # Replace with actual proxies
-    'http://proxy2.example.com:8080',
-    'http://proxy3.example.com:8080'
-]
-
-MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds
-
-def get_youtube_transcript(video_id):
-    """
-    Get transcript with proxy support and retry mechanism.
-    """
-    formatter = TextFormatter()
-    last_error = None
-    
-    for attempt in range(MAX_RETRIES):
-        try:
-            # Randomly select a proxy (None means no proxy)
-            current_proxy = random.choice(PROXY_LIST)
-            
-            if current_proxy:
-                st.info(f"Attempt {attempt + 1}/{MAX_RETRIES}: Using proxy to fetch transcript...")
-                proxies = {
-                    'http': current_proxy,
-                    'https': current_proxy
-                }
-                transcript_list = YouTubeTranscriptApi.get_transcript(
-                    video_id,
-                    proxies=proxies
-                )
-            else:
-                st.info(f"Attempt {attempt + 1}/{MAX_RETRIES}: Fetching transcript directly...")
-                transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-
-            if not transcript_list:
-                st.warning("No transcript content available for this video.")
-                return None
-
-            # Format transcript
-            formatted_transcript = formatter.format_transcript(transcript_list)
-            if not formatted_transcript.strip():
-                st.warning("Transcript is empty after processing.")
-                return None
-
-            return formatted_transcript
-
-        except (TranscriptsDisabled, NoTranscriptFound) as e:
-            st.error("Transcripts are disabled or not available for this video.")
-            return None
-            
-        except Exception as e:
-            last_error = str(e)
-            if "too many requests" in last_error.lower() or "blocked" in last_error.lower():
-                # If this is not the last attempt, wait and try again
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_DELAY * (attempt + 1)  # Exponential backoff
-                    st.warning(f"YouTube API rate limit hit. Waiting {delay} seconds before retrying...")
-                    time.sleep(delay)
-                    continue
-            else:
-                # For other errors, log and continue retrying
-                logger.warning(f"Error fetching transcript (attempt {attempt + 1}): {str(e)}")
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY)
-                    continue
-
-    # If we get here, all retries failed
-    st.error(f"Failed to fetch transcript after {MAX_RETRIES} attempts. Last error: {last_error}")
-    logger.error(f"All transcript fetch attempts failed. Last error: {last_error}")
-    return None
-
 # Existing functions (extract_video_id, get_video_title, get_youtube_transcript, etc.)
 def extract_video_id(url):
     patterns = [
@@ -268,6 +191,24 @@ def get_video_title(video_id):
         logger.warning(f"Could not get video title: {str(e)}")
         return f"YouTube Video {video_id}"
 
+def get_youtube_transcript(video_id):
+    try:
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        if not transcript_list:
+            st.error("No transcript content available for this video.")
+            return None
+        full_transcript = " ".join([part["text"] + " " for part in transcript_list])
+        if not full_transcript.strip():
+            st.error("Transcript is empty after processing.")
+            return None
+        return full_transcript
+    except TranscriptsDisabled:
+        st.error("Transcripts are disabled for this video.")
+        return None
+    except Exception as e:
+        st.error(f"No transcript available for this video: {str(e)}")
+        return None
+        
 def polish_transcript_with_gemini(raw_transcript: str, video_title: str) -> str:
     """
     Polish raw YouTube transcript using Gemini to make it context-aware and AI-friendly.
@@ -906,94 +847,6 @@ def basic_semantic_analysis(claim: Claim, evidence: List[SearchResult]) -> FactC
         sources=evidence,
         evidence_summary=f"Found {len(evidence)} sources, {matching_evidence} with relevant content"
     )
-
-def enhanced_semantic_analysis(claim: Claim, evidence: List[SearchResult]) -> FactCheckResult:
-    """
-    Enhanced semantic analysis of claims using Gemini for more accurate fact-checking
-    while preserving context and meaning.
-    """
-    llm = get_llm()
-    if not llm:
-        logger.warning("LLM not available, falling back to basic analysis")
-        return basic_semantic_analysis(claim, evidence)
-
-    try:
-        # Calculate semantic similarities for evidence ranking
-        similarities = calculate_evidence_similarity(claim.text, evidence)
-        
-        # Sort evidence by both similarity and credibility
-        evidence_scores = []
-        for i, result in enumerate(evidence):
-            combined_score = (similarities[i] * 0.6) + (result.credibility_score * 0.4)
-            evidence_scores.append((result, combined_score))
-        
-        evidence_scores.sort(key=lambda x: x[1], reverse=True)
-        top_evidence = [e[0] for e in evidence_scores[:3]]  # Use top 3 most relevant pieces of evidence
-
-        # Construct analysis prompt
-        analysis_prompt = f"""
-Analyze this claim against the provided evidence with extreme attention to detail and context preservation.
-
-CLAIM TO VERIFY: {claim.text}
-CLAIM CATEGORY: {claim.category}
-
-EVIDENCE SOURCES:
-{chr(10).join(f'SOURCE {i+1} ({source.source_domain}, Credibility: {source.credibility_score:.1%}):\n{source.snippet}\n' for i, source in enumerate(top_evidence))}
-
-ANALYSIS INSTRUCTIONS:
-1. Evaluate if the claim is fully supported, partially supported, contradicted, or unverifiable based on evidence
-2. Consider source credibility and relevance
-3. Look for specific numbers, dates, facts that can be directly compared
-4. Note any context or qualifications that affect the claim's accuracy
-5. Consider temporal context (when the claim was made vs. evidence)
-
-OUTPUT FORMAT:
-1. VERDICT: Exactly one of ["TRUE", "FALSE", "UNCERTAIN"]
-2. CONFIDENCE: Number between 0.0 and 1.0
-3. EXPLANATION: Detailed reasoning
-4. EVIDENCE SUMMARY: Key supporting/contradicting points
-
-Respond in JSON format only.
-"""
-
-        # Get LLM analysis
-        response = llm.invoke(analysis_prompt)
-        
-        try:
-            # Clean and parse JSON response
-            response_text = response.content.strip()
-            if response_text.startswith('```json'):
-                response_text = response_text[7:-3]
-            elif response_text.startswith('```'):
-                response_text = response_text[3:-3]
-            
-            analysis = json.loads(response_text)
-            
-            # Validate and normalize verdict
-            verdict = analysis.get('VERDICT', 'UNCERTAIN').upper()
-            if verdict not in ['TRUE', 'FALSE', 'UNCERTAIN']:
-                verdict = 'UNCERTAIN'
-            
-            # Validate confidence
-            confidence = float(analysis.get('CONFIDENCE', 0.5))
-            confidence = max(0.0, min(1.0, confidence))  # Clamp between 0 and 1
-            
-            return FactCheckResult(
-                claim=claim,
-                verdict=verdict,
-                confidence=confidence,
-                explanation=analysis.get('EXPLANATION', 'No detailed explanation provided'),
-                sources=top_evidence,
-                evidence_summary=analysis.get('EVIDENCE_SUMMARY', 'No evidence summary provided')
-            )
-            
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.error(f"Error parsing LLM response: {str(e)}")
-            return basic_semantic_analysis(claim, evidence)
-            
-    except Exception as e:
-        logger.error(f"Error in enhanced semantic analysis: {str(e)}")
-        return basic_semantic_analysis(claim, evidence)
 
 # UI COMPONENTS
 
