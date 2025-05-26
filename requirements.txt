@@ -20,3 +20,4 @@ protobuf
 wikipedia
 beautifulsoup4
 scikit-learn
+google-search-results  # SerpAPI client
