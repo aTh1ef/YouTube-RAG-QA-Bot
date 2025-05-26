@@ -10,6 +10,14 @@ from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
 from urllib.parse import quote_plus
 import hashlib
+import wikipedia
+from bs4 import BeautifulSoup
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from urllib.parse import urljoin
+import warnings
+warnings.filterwarnings("ignore")
 
 # Set up logging
 logging.basicConfig(
@@ -111,10 +119,13 @@ except Exception as e:
 # Configuration
 PINECONE_INDEX_NAME = "youtube-qa-bot"
 CREDIBLE_DOMAINS = {
-    'wikipedia.org': 0.8, 'edu': 0.9, 'gov': 0.95, 'nature.com': 0.9,
-    'sciencedirect.com': 0.85, 'pubmed.ncbi.nlm.nih.gov': 0.9,
-    'bbc.com': 0.8, 'reuters.com': 0.85, 'ap.org': 0.85,
-    'cnn.com': 0.7, 'nytimes.com': 0.8, 'washingtonpost.com': 0.8
+    'wikipedia.org': 0.85, 'edu': 0.9, 'gov': 0.95, 
+    'nature.com': 0.9, 'sciencedirect.com': 0.85, 
+    'pubmed.ncbi.nlm.nih.gov': 0.9, 'bbc.com': 0.8, 
+    'reuters.com': 0.85, 'ap.org': 0.85, 'cnn.com': 0.7, 
+    'nytimes.com': 0.8, 'washingtonpost.com': 0.8,
+    'duckduckgo.com': 0.6, 'britannica.com': 0.8,
+    'nationalgeographic.com': 0.75, 'smithsonianmag.com': 0.75
 }
 
 # Cache models to avoid reinitialization
@@ -573,157 +584,119 @@ Response format: JSON array of claim objects only
     return claims
 
 def search_claim_evidence(claim: Claim, max_results: int = 5) -> List[SearchResult]:
-    """Search for evidence about a claim using Google Custom Search API."""
+    """Search for evidence about a claim using free sources."""
     try:
-        # Prepare search query
-        search_query = claim.text[:100]  # Limit query length
-        encoded_query = quote_plus(search_query)
-        
-        # Google Custom Search API endpoint
-        url = f"https://www.googleapis.com/customsearch/v1"
-        params = {
-            'key': GOOGLE_SEARCH_API_KEY,
-            'cx': GOOGLE_SEARCH_ENGINE_ID,
-            'q': encoded_query,
-            'num': max_results
-        }
-        
-        response = requests.get(url, params=params)
-        response.raise_for_status()
-        
-        search_data = response.json()
         results = []
         
-        if 'items' in search_data:
-            for item in search_data['items']:
-                # Calculate credibility score
-                domain = item.get('displayLink', '')
-                credibility_score = 0.5  # Default score
-                
-                for credible_domain, score in CREDIBLE_DOMAINS.items():
-                    if credible_domain in domain.lower():
-                        credibility_score = score
-                        break
-                
-                result = SearchResult(
-                    title=item.get('title', ''),
-                    snippet=item.get('snippet', ''),
-                    url=item.get('link', ''),
-                    source_domain=domain,
-                    credibility_score=credibility_score
-                )
-                results.append(result)
+        # 1. Wikipedia Search (Primary source)
+        wiki_results = search_wikipedia_evidence(claim.text, max_results=3)
+        results.extend(wiki_results)
         
-        return results
+        # 2. DuckDuckGo Search (Secondary source)
+        ddg_results = search_duckduckgo_evidence(claim.text, max_results=2)
+        results.extend(ddg_results)
+        
+        # Remove duplicates and sort by credibility
+        unique_results = []
+        seen_urls = set()
+        
+        for result in results:
+            if result.url not in seen_urls:
+                unique_results.append(result)
+                seen_urls.add(result.url)
+        
+        # Sort by credibility score
+        unique_results.sort(key=lambda x: x.credibility_score, reverse=True)
+        
+        return unique_results[:max_results]
         
     except Exception as e:
         logger.error(f"Error searching for claim evidence: {str(e)}")
         return []
 
-def analyze_claim_with_evidence(claim: Claim, evidence: List[SearchResult]) -> FactCheckResult:
-    """Analyze a claim against evidence using Gemini to determine truth value."""
-    llm = get_llm()
-    if not llm:
-        return FactCheckResult(
-            claim=claim,
-            verdict="UNCERTAIN",
-            confidence=0.0,
-            explanation="Could not analyze claim due to LLM unavailability",
-            sources=evidence,
-            evidence_summary="No analysis available"
-        )
-    
-    analysis_prompt = """
-    You are a fact-checking expert. Analyze the following claim against the provided evidence and determine if it's TRUE, FALSE, or UNCERTAIN.
-
-    CLAIM TO VERIFY:
-    "{claim_text}"
-
-    EVIDENCE FROM WEB SEARCH:
-    {evidence_text}
-
-    Instructions:
-    1. Compare the claim against the evidence provided
-    2. Consider the credibility of sources (higher credibility = more weight)
-    3. Look for consensus across multiple sources
-    4. Be conservative - if evidence is mixed or insufficient, mark as UNCERTAIN
-
-    Respond with a JSON object containing:
-    - "verdict": "TRUE", "FALSE", or "UNCERTAIN"
-    - "confidence": float between 0.0 and 1.0
-    - "explanation": detailed explanation of your reasoning
-    - "evidence_summary": brief summary of key evidence points
-
-    JSON Response:
-    """
-    
-    # Format evidence for prompt
-    evidence_text = ""
-    for i, result in enumerate(evidence, 1):
-        evidence_text += f"{i}. Source: {result.source_domain} (Credibility: {result.credibility_score})\n"
-        evidence_text += f"   Title: {result.title}\n"
-        evidence_text += f"   Content: {result.snippet}\n\n"
+def search_wikipedia_evidence(query: str, max_results: int = 3) -> List[SearchResult]:
+    """Search Wikipedia for evidence about a claim."""
+    results = []
     
     try:
-        prompt = analysis_prompt.format(
-            claim_text=claim.text,
-            evidence_text=evidence_text
-        )
+        wikipedia.set_lang("en")
+        search_results = wikipedia.search(query, results=max_results * 2)
         
-        response = llm.invoke(prompt)
-        
-        # Parse JSON response
-        try:
-            response_text = response.content.strip()
-            if response_text.startswith('```json'):
-                response_text = response_text[7:-3]
-            elif response_text.startswith('```'):
-                response_text = response_text[3:-3]
-            
-            analysis_data = json.loads(response_text)
-            
-            return FactCheckResult(
-                claim=claim,
-                verdict=analysis_data.get('verdict', 'UNCERTAIN'),
-                confidence=float(analysis_data.get('confidence', 0.0)),
-                explanation=analysis_data.get('explanation', 'No explanation provided'),
-                sources=evidence,
-                evidence_summary=analysis_data.get('evidence_summary', 'No summary available')
-            )
-            
-        except json.JSONDecodeError as e:
-            logger.warning(f"Could not parse JSON from analysis response: {e}")
-            # Fallback analysis
-            response_text = response.content.lower()
-            if 'true' in response_text and 'false' not in response_text:
-                verdict = "TRUE"
-                confidence = 0.6
-            elif 'false' in response_text and 'true' not in response_text:
-                verdict = "FALSE"
-                confidence = 0.6
-            else:
-                verdict = "UNCERTAIN"
-                confidence = 0.3
-            
-            return FactCheckResult(
-                claim=claim,
-                verdict=verdict,
-                confidence=confidence,
-                explanation=response.content,
-                sources=evidence,
-                evidence_summary="Analysis based on text parsing"
-            )
-            
+        for title in search_results[:max_results]:
+            try:
+                page = wikipedia.page(title, auto_suggest=False)
+                summary = page.summary[:500]
+                
+                result = SearchResult(
+                    title=page.title,
+                    snippet=summary,
+                    url=page.url,
+                    source_domain="wikipedia.org",
+                    credibility_score=0.85
+                )
+                results.append(result)
+                
+            except (wikipedia.exceptions.DisambiguationError, 
+                   wikipedia.exceptions.PageError, Exception) as e:
+                logger.warning(f"Wikipedia error for {title}: {str(e)}")
+                continue
+                
     except Exception as e:
-        logger.error(f"Error analyzing claim: {str(e)}")
-        return FactCheckResult(
-            claim=claim,
-            verdict="UNCERTAIN",
-            confidence=0.0,
-            explanation=f"Error during analysis: {str(e)}",
-            sources=evidence,
-            evidence_summary="Analysis failed"
-        )
+        logger.error(f"Error searching Wikipedia: {str(e)}")
+    
+    return results
+
+def search_duckduckgo_evidence(query: str, max_results: int = 2) -> List[SearchResult]:
+    """Search DuckDuckGo for evidence."""
+    results = []
+    
+    try:
+        ddg_url = "https://api.duckduckgo.com/"
+        params = {
+            'q': query,
+            'format': 'json',
+            'no_html': '1',
+            'skip_disambig': '1'
+        }
+        
+        response = requests.get(ddg_url, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            
+            if data.get('AbstractText'):
+                result = SearchResult(
+                    title=data.get('Heading', 'DuckDuckGo Result'),
+                    snippet=data.get('AbstractText', ''),
+                    url=data.get('AbstractURL', ''),
+                    source_domain=data.get('AbstractSource', 'duckduckgo.com'),
+                    credibility_score=0.6
+                )
+                results.append(result)
+            
+            for topic in data.get('RelatedTopics', [])[:max_results-1]:
+                if isinstance(topic, dict) and topic.get('Text'):
+                    result = SearchResult(
+                        title=topic.get('FirstURL', {}).get('Text', 'Related Topic'),
+                        snippet=topic.get('Text', ''),
+                        url=topic.get('FirstURL', {}).get('URL', ''),
+                        source_domain='duckduckgo.com',
+                        credibility_score=0.5
+                    )
+                    results.append(result)
+                    
+    except Exception as e:
+        logger.warning(f"Error searching DuckDuckGo: {str(e)}")
+    
+    return results
+
+def analyze_claim_with_evidence(claim: Claim, evidence: List[SearchResult]) -> FactCheckResult:
+    """Analyze a claim against evidence using enhanced semantic analysis."""
+    try:
+        return enhanced_semantic_analysis(claim, evidence)
+    except Exception as e:
+        logger.error(f"Error in enhanced analysis: {str(e)}")
+        return basic_semantic_analysis(claim, evidence)
 
 def perform_fact_checking(transcript_chunks: List[Document]) -> List[FactCheckResult]:
     # Main fact-checking pipeline.
@@ -812,6 +785,68 @@ def fact_check_single_claim(claim: Claim) -> FactCheckResult:
             sources=[],
             evidence_summary="Fact-checking failed due to technical error"
         )
+
+# Add these new functions
+def calculate_evidence_similarity(claim_text: str, evidence: List[SearchResult]) -> List[float]:
+    """Calculate semantic similarity between claim and evidence using TF-IDF."""
+    if not evidence:
+        return []
+    
+    try:
+        texts = [claim_text] + [result.snippet for result in evidence]
+        vectorizer = TfidfVectorizer(stop_words='english', ngram_range=(1, 2))
+        tfidf_matrix = vectorizer.fit_transform(texts)
+        
+        claim_vector = tfidf_matrix[0]
+        evidence_vectors = tfidf_matrix[1:]
+        similarities = cosine_similarity(claim_vector, evidence_vectors)[0]
+        
+        return similarities.tolist()
+        
+    except Exception as e:
+        logger.warning(f"Error calculating similarity: {str(e)}")
+        return [0.0] * len(evidence)
+
+def basic_semantic_analysis(claim: Claim, evidence: List[SearchResult]) -> FactCheckResult:
+    """Fallback analysis when LLM is unavailable."""
+    if not evidence:
+        return FactCheckResult(
+            claim=claim,
+            verdict="UNCERTAIN",
+            confidence=0.0,
+            explanation="No evidence found for verification",
+            sources=[],
+            evidence_summary="No sources available"
+        )
+    
+    claim_words = set(claim.text.lower().split())
+    total_credibility = 0
+    matching_evidence = 0
+    
+    for result in evidence:
+        evidence_words = set(result.snippet.lower().split())
+        word_overlap = len(claim_words.intersection(evidence_words))
+        
+        if word_overlap > 2:
+            matching_evidence += 1
+            total_credibility += result.credibility_score
+    
+    if matching_evidence > 0:
+        avg_credibility = total_credibility / matching_evidence
+        confidence = min(0.8, avg_credibility * (matching_evidence / len(evidence)))
+        verdict = "TRUE" if confidence > 0.5 else "UNCERTAIN"
+    else:
+        verdict = "UNCERTAIN"
+        confidence = 0.2
+    
+    return FactCheckResult(
+        claim=claim,
+        verdict=verdict,
+        confidence=confidence,
+        explanation=f"Based on keyword matching with {matching_evidence} relevant sources",
+        sources=evidence,
+        evidence_summary=f"Found {len(evidence)} sources, {matching_evidence} with relevant content"
+    )
 
 # UI COMPONENTS
 
