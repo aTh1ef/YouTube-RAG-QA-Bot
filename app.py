@@ -848,6 +848,94 @@ def basic_semantic_analysis(claim: Claim, evidence: List[SearchResult]) -> FactC
         evidence_summary=f"Found {len(evidence)} sources, {matching_evidence} with relevant content"
     )
 
+def enhanced_semantic_analysis(claim: Claim, evidence: List[SearchResult]) -> FactCheckResult:
+    """
+    Enhanced semantic analysis of claims using Gemini for more accurate fact-checking
+    while preserving context and meaning.
+    """
+    llm = get_llm()
+    if not llm:
+        logger.warning("LLM not available, falling back to basic analysis")
+        return basic_semantic_analysis(claim, evidence)
+
+    try:
+        # Calculate semantic similarities for evidence ranking
+        similarities = calculate_evidence_similarity(claim.text, evidence)
+        
+        # Sort evidence by both similarity and credibility
+        evidence_scores = []
+        for i, result in enumerate(evidence):
+            combined_score = (similarities[i] * 0.6) + (result.credibility_score * 0.4)
+            evidence_scores.append((result, combined_score))
+        
+        evidence_scores.sort(key=lambda x: x[1], reverse=True)
+        top_evidence = [e[0] for e in evidence_scores[:3]]  # Use top 3 most relevant pieces of evidence
+
+        # Construct analysis prompt
+        analysis_prompt = f"""
+Analyze this claim against the provided evidence with extreme attention to detail and context preservation.
+
+CLAIM TO VERIFY: {claim.text}
+CLAIM CATEGORY: {claim.category}
+
+EVIDENCE SOURCES:
+{chr(10).join(f'SOURCE {i+1} ({source.source_domain}, Credibility: {source.credibility_score:.1%}):\n{source.snippet}\n' for i, source in enumerate(top_evidence))}
+
+ANALYSIS INSTRUCTIONS:
+1. Evaluate if the claim is fully supported, partially supported, contradicted, or unverifiable based on evidence
+2. Consider source credibility and relevance
+3. Look for specific numbers, dates, facts that can be directly compared
+4. Note any context or qualifications that affect the claim's accuracy
+5. Consider temporal context (when the claim was made vs. evidence)
+
+OUTPUT FORMAT:
+1. VERDICT: Exactly one of ["TRUE", "FALSE", "UNCERTAIN"]
+2. CONFIDENCE: Number between 0.0 and 1.0
+3. EXPLANATION: Detailed reasoning
+4. EVIDENCE SUMMARY: Key supporting/contradicting points
+
+Respond in JSON format only.
+"""
+
+        # Get LLM analysis
+        response = llm.invoke(analysis_prompt)
+        
+        try:
+            # Clean and parse JSON response
+            response_text = response.content.strip()
+            if response_text.startswith('```json'):
+                response_text = response_text[7:-3]
+            elif response_text.startswith('```'):
+                response_text = response_text[3:-3]
+            
+            analysis = json.loads(response_text)
+            
+            # Validate and normalize verdict
+            verdict = analysis.get('VERDICT', 'UNCERTAIN').upper()
+            if verdict not in ['TRUE', 'FALSE', 'UNCERTAIN']:
+                verdict = 'UNCERTAIN'
+            
+            # Validate confidence
+            confidence = float(analysis.get('CONFIDENCE', 0.5))
+            confidence = max(0.0, min(1.0, confidence))  # Clamp between 0 and 1
+            
+            return FactCheckResult(
+                claim=claim,
+                verdict=verdict,
+                confidence=confidence,
+                explanation=analysis.get('EXPLANATION', 'No detailed explanation provided'),
+                sources=top_evidence,
+                evidence_summary=analysis.get('EVIDENCE_SUMMARY', 'No evidence summary provided')
+            )
+            
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Error parsing LLM response: {str(e)}")
+            return basic_semantic_analysis(claim, evidence)
+            
+    except Exception as e:
+        logger.error(f"Error in enhanced semantic analysis: {str(e)}")
+        return basic_semantic_analysis(claim, evidence)
+
 # UI COMPONENTS
 
 def render_fact_check_results(results: List[FactCheckResult]):
