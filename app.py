@@ -48,7 +48,6 @@ from langchain_pinecone import PineconeVectorStore
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled, NoTranscriptFound
 from youtube_transcript_api.formatters import TextFormatter
-import yt_dlp
 import random
 from requests.exceptions import RequestException
 
@@ -182,96 +181,66 @@ PROXY_LIST = [
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
 
-def get_transcript_using_ytdlp(video_id):
-    """
-    Fallback method to get transcript using yt-dlp.
-    """
-    try:
-        ydl_opts = {
-            'writesubtitles': True,
-            'writeautomaticsub': True,
-            'subtitlesformat': 'ttml',
-            'skip_download': True,
-            'quiet': True
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            url = f'https://www.youtube.com/watch?v={video_id}'
-            info = ydl.extract_info(url, download=False)
-            
-            # Try to get manual subtitles first
-            if info.get('subtitles') and info['subtitles'].get('en'):
-                st.info("Using manual English subtitles from video...")
-                return ' '.join([caption.get('text', '') for caption in info['subtitles']['en']])
-            
-            # Fall back to automatic captions if manual not available
-            elif info.get('automatic_captions') and info['automatic_captions'].get('en'):
-                st.info("Using auto-generated English captions...")
-                return ' '.join([caption.get('text', '') for caption in info['automatic_captions']['en']])
-            
-        return None
-    except Exception as e:
-        logger.error(f"Error getting transcript with yt-dlp: {str(e)}")
-        return None
-
 def get_youtube_transcript(video_id):
     """
-    Get transcript with fallback to yt-dlp if YouTube Transcript API fails.
+    Get transcript with proxy support and retry mechanism.
     """
     formatter = TextFormatter()
     last_error = None
     
-    # First try: YouTube Transcript API
     for attempt in range(MAX_RETRIES):
         try:
-            st.info(f"Attempt {attempt + 1}/{MAX_RETRIES}: Fetching transcript using YouTube Transcript API...")
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+            # Randomly select a proxy (None means no proxy)
+            current_proxy = random.choice(PROXY_LIST)
+            
+            if current_proxy:
+                st.info(f"Attempt {attempt + 1}/{MAX_RETRIES}: Using proxy to fetch transcript...")
+                proxies = {
+                    'http': current_proxy,
+                    'https': current_proxy
+                }
+                transcript_list = YouTubeTranscriptApi.get_transcript(
+                    video_id,
+                    proxies=proxies
+                )
+            else:
+                st.info(f"Attempt {attempt + 1}/{MAX_RETRIES}: Fetching transcript directly...")
+                transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
 
             if not transcript_list:
                 st.warning("No transcript content available for this video.")
-                break  # Try fallback method
+                return None
 
             # Format transcript
             formatted_transcript = formatter.format_transcript(transcript_list)
             if not formatted_transcript.strip():
                 st.warning("Transcript is empty after processing.")
-                break  # Try fallback method
+                return None
 
             return formatted_transcript
 
         except (TranscriptsDisabled, NoTranscriptFound) as e:
-            st.warning("Transcripts are disabled or not found. Trying alternative method...")
-            break  # Try fallback method
+            st.error("Transcripts are disabled or not available for this video.")
+            return None
             
         except Exception as e:
             last_error = str(e)
             if "too many requests" in last_error.lower() or "blocked" in last_error.lower():
+                # If this is not the last attempt, wait and try again
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_DELAY * (attempt + 1)  # Exponential backoff
                     st.warning(f"YouTube API rate limit hit. Waiting {delay} seconds before retrying...")
                     time.sleep(delay)
                     continue
-                else:
-                    st.warning("YouTube Transcript API failed. Trying alternative method...")
-                    break  # Try fallback method
             else:
+                # For other errors, log and continue retrying
                 logger.warning(f"Error fetching transcript (attempt {attempt + 1}): {str(e)}")
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY)
                     continue
-                else:
-                    st.warning("YouTube Transcript API failed. Trying alternative method...")
-                    break  # Try fallback method
 
-    # Fallback: Try yt-dlp
-    st.info("Attempting to fetch transcript using alternative method (yt-dlp)...")
-    ytdlp_transcript = get_transcript_using_ytdlp(video_id)
-    
-    if ytdlp_transcript:
-        return ytdlp_transcript
-    
-    # If both methods failed
-    st.error(f"Failed to fetch transcript using all available methods. Last error: {last_error}")
+    # If we get here, all retries failed
+    st.error(f"Failed to fetch transcript after {MAX_RETRIES} attempts. Last error: {last_error}")
     logger.error(f"All transcript fetch attempts failed. Last error: {last_error}")
     return None
 
