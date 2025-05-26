@@ -17,7 +17,118 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 from urllib.parse import urljoin
 import warnings
+import requests  # We'll use requests instead of serpapi
 warnings.filterwarnings("ignore")
+
+# Data classes
+@dataclass
+class Claim:
+    text: str
+    source_chunk: str
+    timestamp: str = ""
+    category: str = ""
+
+@dataclass
+class SearchResult:
+    title: str
+    snippet: str
+    url: str
+    source_domain: str
+
+def extract_domain(url: str) -> str:
+    """Extract domain from URL."""
+    try:
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.lower()
+        # Remove www. if present
+        if domain.startswith('www.'):
+            domain = domain[4:]
+        return domain
+    except:
+        return ""
+
+def search_sources_for_claim(claim: str, max_results: int = 10) -> List[SearchResult]:
+    """
+    Search for sources related to a claim using Google Custom Search.
+    Returns a simple list of relevant sources without making judgments.
+    """
+    results = []
+    
+    try:
+        params = {
+            'key': GOOGLE_SEARCH_API_KEY,
+            'cx': GOOGLE_SEARCH_ENGINE_ID,
+            'q': claim,
+            'num': min(max_results, 10),
+            'safe': 'active'
+        }
+        
+        response = requests.get(
+            'https://www.googleapis.com/customsearch/v1',
+            params=params,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            items = data.get('items', [])
+            
+            for item in items:
+                title = item.get('title', '')
+                snippet = item.get('snippet', '')
+                link = item.get('link', '')
+                domain = extract_domain(link)
+                
+                if all([title, snippet, link]):
+                    result = SearchResult(
+                        title=title,
+                        snippet=snippet,
+                        url=link,
+                        source_domain=domain
+                    )
+                    results.append(result)
+                
+    except Exception as e:
+        logger.error(f"Google Custom Search error: {str(e)}")
+        st.error(f"Error searching for sources: {str(e)}")
+    
+    return results
+
+def render_sources_ui(sources: List[SearchResult]):
+    """
+    Render the list of sources in the UI.
+    """
+    if not sources:
+        st.info("No sources found for this claim.")
+        return
+        
+    st.markdown("### 🔍 Related Sources")
+    
+    for i, source in enumerate(sources, 1):
+        with st.container():
+            st.markdown(f"**{i}. [{source.title}]({source.url})**")
+            st.markdown(f"📍 *{source.source_domain}*")
+            st.markdown(f"{source.snippet}")
+            st.markdown("---")
+
+def render_individual_claims_ui(claims: List[Claim]):
+    """Render UI for showing claims and their sources."""
+    if not claims:
+        st.info("No claims available to check.")
+        return
+    
+    # Display each claim with a search button
+    for i, claim in enumerate(claims):
+        with st.expander(f"Claim {i+1}: {claim.text[:100]}{'...' if len(claim.text) > 100 else ''}", expanded=False):
+            # Display claim details
+            st.markdown(f"**Full Claim:** {claim.text}")
+            st.markdown(f"**Source Chunk:** {claim.source_chunk}")
+            
+            # Search button
+            if st.button(f"🔍 Find Sources for Claim {i+1}", key=f"search_{i}"):
+                with st.spinner("Searching for sources..."):
+                    sources = search_sources_for_claim(claim.text)
+                    render_sources_ui(sources)
 
 # Set up logging
 logging.basicConfig(
@@ -49,21 +160,6 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import TranscriptsDisabled
 
 # Data classes for fact-checking
-@dataclass
-class Claim:
-    text: str
-    source_chunk: str
-    timestamp: str = ""
-    category: str = ""
-
-@dataclass
-class SearchResult:
-    title: str
-    snippet: str
-    url: str
-    source_domain: str
-    credibility_score: float = 0.0
-
 @dataclass
 class FactCheckResult:
     claim: Claim
@@ -101,6 +197,7 @@ try:
     PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
     PINECONE_ENVIRONMENT = st.secrets.get("PINECONE_ENVIRONMENT", "gcp-starter")
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+    SERPAPI_KEY = st.secrets["SERPAPI_KEY"]  # Make it required, not optional!
     GOOGLE_SEARCH_API_KEY = st.secrets["GOOGLE_SEARCH_API_KEY"]
     GOOGLE_SEARCH_ENGINE_ID = st.secrets["GOOGLE_SEARCH_ENGINE_ID"]
 
@@ -118,14 +215,32 @@ except Exception as e:
 
 # Configuration
 PINECONE_INDEX_NAME = "youtube-qa-bot"
+# Enhanced credible domains with better scoring
 CREDIBLE_DOMAINS = {
-    'wikipedia.org': 0.85, 'edu': 0.9, 'gov': 0.95, 
-    'nature.com': 0.9, 'sciencedirect.com': 0.85, 
-    'pubmed.ncbi.nlm.nih.gov': 0.9, 'bbc.com': 0.8, 
-    'reuters.com': 0.85, 'ap.org': 0.85, 'cnn.com': 0.7, 
-    'nytimes.com': 0.8, 'washingtonpost.com': 0.8,
-    'duckduckgo.com': 0.6, 'britannica.com': 0.8,
-    'nationalgeographic.com': 0.75, 'smithsonianmag.com': 0.75
+    # News & Media (High Priority)
+    'reuters.com': 0.95, 'ap.org': 0.95, 'bbc.com': 0.90,
+    'npr.org': 0.90, 'pbs.org': 0.85, 'wsj.com': 0.85,
+    'nytimes.com': 0.85, 'washingtonpost.com': 0.85,
+    'theguardian.com': 0.80, 'economist.com': 0.85,
+    
+    # Academic & Research (Highest Priority)
+    'edu': 0.95, 'gov': 0.98, 'nature.com': 0.95,
+    'science.org': 0.95, 'cell.com': 0.95,
+    'pubmed.ncbi.nlm.nih.gov': 0.95, 'nih.gov': 0.95,
+    'who.int': 0.95, 'cdc.gov': 0.95,
+    
+    # Reference & Encyclopedia
+    'britannica.com': 0.85, 'merriam-webster.com': 0.80,
+    'wikipedia.org': 0.70,  # Reduced Wikipedia credibility
+    
+    # Tech & Business (Specialized)
+    'techcrunch.com': 0.75, 'arstechnica.com': 0.80,
+    'wired.com': 0.75, 'forbes.com': 0.75,
+    'bloomberg.com': 0.85, 'cnbc.com': 0.75,
+    
+    # Fact-checking sites (High Priority)
+    'snopes.com': 0.90, 'factcheck.org': 0.95,
+    'politifact.com': 0.90, 'fullfact.org': 0.90
 }
 
 # Cache models to avoid reinitialization
@@ -583,29 +698,171 @@ Response format: JSON array of claim objects only
     
     return claims
 
-def search_claim_evidence(claim: Claim, max_results: int = 5) -> List[SearchResult]:
-    """Search for evidence about a claim using free sources."""
+def search_with_serpapi(query: str, max_results: int = 8) -> List[SearchResult]:
+    """
+    Enhanced SerpAPI search with better error handling and more results.
+    """
+    results = []
+    
+    if not SERPAPI_KEY:
+        logger.error("SerpAPI key not found!")
+        return results
+        
     try:
-        results = []
+        # Enhanced search parameters
+        params = {
+            "q": query,
+            "api_key": SERPAPI_KEY,
+            "engine": "google",
+            "num": str(min(max_results, 10)),  # Google max is 10
+            "gl": "us",
+            "hl": "en",
+            "safe": "active",
+            "filter": "1"  # Remove duplicate results
+        }
         
-        # 1. Wikipedia Search (Primary source)
-        wiki_results = search_wikipedia_evidence(claim.text, max_results=3)
-        results.extend(wiki_results)
+        logger.info(f"Searching SerpAPI for: {query}")
         
-        # 2. DuckDuckGo Search (Secondary source)
-        ddg_results = search_duckduckgo_evidence(claim.text, max_results=2)
-        results.extend(ddg_results)
+        # Make API request with timeout
+        response = requests.get(
+            "https://serpapi.com/search", 
+            params=params,
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"SerpAPI request failed: {response.status_code} - {response.text}")
+            return results
+            
+        data = response.json()
+        
+        # Check for API errors
+        if "error" in data:
+            logger.error(f"SerpAPI error: {data['error']}")
+            return results
+            
+        organic_results = data.get("organic_results", [])
+        logger.info(f"SerpAPI returned {len(organic_results)} results")
+        
+        for result in organic_results:
+            title = result.get("title", "")
+            snippet = result.get("snippet", "")
+            link = result.get("link", "")
+            
+            if not all([title, snippet, link]):
+                continue
+                
+            domain = extract_domain(link)
+            
+            # Calculate credibility score with SerpAPI boost
+            base_credibility = CREDIBLE_DOMAINS.get(domain, 0.6)  # Higher default for SerpAPI
+            
+            # Boost credibility for SerpAPI results
+            boosted_credibility = min(1.0, base_credibility + 0.1)
+            
+            search_result = SearchResult(
+                title=title,
+                snippet=snippet,
+                url=link,
+                source_domain=domain,
+                credibility_score=boosted_credibility
+            )
+            results.append(search_result)
+            
+        return results
+        
+    except requests.exceptions.Timeout:
+        logger.error("SerpAPI request timed out")
+        return results
+    except requests.exceptions.RequestException as e:
+        logger.error(f"SerpAPI request error: {str(e)}")
+        return results
+    except Exception as e:
+        logger.error(f"Unexpected error in SerpAPI search: {str(e)}")
+        return results
+
+def search_with_google_custom(query: str, max_results: int = 5) -> List[SearchResult]:
+    """
+    Fallback Google Custom Search API when SerpAPI fails.
+    """
+    results = []
+    
+    try:
+        params = {
+            'key': GOOGLE_SEARCH_API_KEY,
+            'cx': GOOGLE_SEARCH_ENGINE_ID,
+            'q': query,
+            'num': min(max_results, 10),
+            'safe': 'active'
+        }
+        
+        response = requests.get(
+            'https://www.googleapis.com/customsearch/v1',
+            params=params,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            items = data.get('items', [])
+            
+            for item in items:
+                title = item.get('title', '')
+                snippet = item.get('snippet', '')
+                link = item.get('link', '')
+                domain = extract_domain(link)
+                
+                search_result = SearchResult(
+                    title=title,
+                    snippet=snippet,
+                    url=link,
+                    source_domain=domain,
+                    credibility_score=CREDIBLE_DOMAINS.get(domain, 0.5)
+                )
+                results.append(search_result)
+                
+    except Exception as e:
+        logger.error(f"Google Custom Search error: {str(e)}")
+    
+    return results
+
+def search_claim_evidence(claim: Claim, max_results: int = 8) -> List[SearchResult]:
+    """
+    Enhanced evidence search prioritizing SerpAPI with fallbacks.
+    """
+    try:
+        all_results = []
+        
+        # 1. Primary: SerpAPI Search (Higher quota)
+        serp_results = search_with_serpapi(claim.text, max_results=max_results)
+        if serp_results:
+            all_results.extend(serp_results)
+            logger.info(f"SerpAPI found {len(serp_results)} results")
+        else:
+            logger.warning("SerpAPI returned no results, trying fallback")
+            
+            # 2. Fallback: Google Custom Search
+            google_results = search_with_google_custom(claim.text, max_results=max_results//2)
+            if google_results:
+                all_results.extend(google_results)
+                logger.info(f"Google Custom Search found {len(google_results)} results")
+        
+        # 3. Last resort: Wikipedia (only if we have very few results)
+        if len(all_results) < 3:
+            wiki_results = search_wikipedia_evidence(claim.text, max_results=3)
+            all_results.extend(wiki_results)
+            logger.info(f"Wikipedia found {len(wiki_results)} results")
         
         # Remove duplicates and sort by credibility
         unique_results = []
         seen_urls = set()
         
-        for result in results:
+        for result in all_results:
             if result.url not in seen_urls:
                 unique_results.append(result)
                 seen_urls.add(result.url)
         
-        # Sort by credibility score
+        # Sort by credibility score (descending)
         unique_results.sort(key=lambda x: x.credibility_score, reverse=True)
         
         return unique_results[:max_results]
@@ -646,50 +903,6 @@ def search_wikipedia_evidence(query: str, max_results: int = 3) -> List[SearchRe
     
     return results
 
-def search_duckduckgo_evidence(query: str, max_results: int = 2) -> List[SearchResult]:
-    """Search DuckDuckGo for evidence."""
-    results = []
-    
-    try:
-        ddg_url = "https://api.duckduckgo.com/"
-        params = {
-            'q': query,
-            'format': 'json',
-            'no_html': '1',
-            'skip_disambig': '1'
-        }
-        
-        response = requests.get(ddg_url, params=params, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            if data.get('AbstractText'):
-                result = SearchResult(
-                    title=data.get('Heading', 'DuckDuckGo Result'),
-                    snippet=data.get('AbstractText', ''),
-                    url=data.get('AbstractURL', ''),
-                    source_domain=data.get('AbstractSource', 'duckduckgo.com'),
-                    credibility_score=0.6
-                )
-                results.append(result)
-            
-            for topic in data.get('RelatedTopics', [])[:max_results-1]:
-                if isinstance(topic, dict) and topic.get('Text'):
-                    result = SearchResult(
-                        title=topic.get('FirstURL', {}).get('Text', 'Related Topic'),
-                        snippet=topic.get('Text', ''),
-                        url=topic.get('FirstURL', {}).get('URL', ''),
-                        source_domain='duckduckgo.com',
-                        credibility_score=0.5
-                    )
-                    results.append(result)
-                    
-    except Exception as e:
-        logger.warning(f"Error searching DuckDuckGo: {str(e)}")
-    
-    return results
-
 def analyze_claim_with_evidence(claim: Claim, evidence: List[SearchResult]) -> FactCheckResult:
     """Analyze a claim against evidence using enhanced semantic analysis."""
     try:
@@ -698,93 +911,182 @@ def analyze_claim_with_evidence(claim: Claim, evidence: List[SearchResult]) -> F
         logger.error(f"Error in enhanced analysis: {str(e)}")
         return basic_semantic_analysis(claim, evidence)
 
-def perform_fact_checking(transcript_chunks: List[Document]) -> List[FactCheckResult]:
-    # Main fact-checking pipeline.
-    results = []
-    
-    # Step 1: Extract claims
-    with st.spinner("Extracting claims from transcript..."):
-        claims = extract_claims_from_transcript(transcript_chunks)
-        st.success(f"Extracted {len(claims)} potential claims")
-    
-    if not claims:
-        st.warning("No verifiable claims found in the transcript.")
-        return results
-    
-    # Step 2: Process each claim
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    for i, claim in enumerate(claims):
-        try:
-            status_text.text(f"Fact-checking claim {i+1} of {len(claims)}: {claim.text[:50]}...")
-            
-            # Search for evidence
-            evidence = search_claim_evidence(claim)
-            
-            if evidence:
-                # Analyze claim with evidence
-                result = analyze_claim_with_evidence(claim, evidence)
-                results.append(result)
-            else:
-                # No evidence found
-                result = FactCheckResult(
-                    claim=claim,
-                    verdict="UNCERTAIN",
-                    confidence=0.0,
-                    explanation="No evidence found through web search",
-                    sources=[],
-                    evidence_summary="No sources available"
-                )
-                results.append(result)
-            
-            # Update progress
-            progress_bar.progress((i + 1) / len(claims))
-            
-            # Rate limiting
-            time.sleep(0.5)  # Avoid hitting API rate limits
-            
-        except Exception as e:
-            logger.error(f"Error processing claim {i}: {str(e)}")
-            continue
-    
-    status_text.text("Fact-checking complete!")
-    progress_bar.empty()
-    
-    return results
+def enhanced_semantic_analysis(claim: Claim, evidence: List[SearchResult]) -> FactCheckResult:
+    """
+    Enhanced analysis that prioritizes SerpAPI results and non-Wikipedia sources.
+    """
+    llm = get_llm()
+    if not llm:
+        logger.warning("LLM not available, falling back to basic analysis")
+        return basic_semantic_analysis(claim, evidence)
 
-def fact_check_single_claim(claim: Claim) -> FactCheckResult:
-    """Fact-check a single claim on-demand."""
     try:
-        # Search for evidence
-        with st.spinner(f"🔍 Searching for evidence about: {claim.text[:50]}..."):
-            evidence = search_claim_evidence(claim)
+        # Calculate semantic similarities
+        similarities = calculate_evidence_similarity(claim.text, evidence)
         
-        if evidence:
+        # Enhanced scoring that heavily favors non-Wikipedia sources
+        evidence_scores = []
+        for i, result in enumerate(evidence):
+            similarity = similarities[i] if i < len(similarities) else 0.0
+            
+            # Heavily prioritize non-Wikipedia sources
+            if result.source_domain == "wikipedia.org":
+                # Wikipedia gets lower combined score
+                combined_score = (similarity * 0.3) + (result.credibility_score * 0.2)
+            else:
+                # Non-Wikipedia sources get much higher weighting
+                combined_score = (similarity * 0.4) + (result.credibility_score * 0.8)
+                
+                # Extra boost for high-credibility domains
+                if result.credibility_score > 0.85:
+                    combined_score *= 1.2
+            
+            evidence_scores.append((result, combined_score))
+        
+        # Sort by combined score and take top evidence
+        evidence_scores.sort(key=lambda x: x[1], reverse=True)
+        top_evidence = [e[0] for e in evidence_scores[:5]]  # Top 5 pieces of evidence
+
+        # Enhanced analysis prompt with source prioritization
+        analysis_prompt = f"""
+Analyze this claim against the provided evidence with extreme attention to detail.
+
+CLAIM TO VERIFY: {claim.text}
+CLAIM CATEGORY: {claim.category}
+
+EVIDENCE SOURCES (ordered by reliability):
+{chr(10).join(f'SOURCE {i+1} - {source.source_domain.upper()} (Credibility: {source.credibility_score:.1%}):\nTitle: {source.title}\nContent: {source.snippet}\nURL: {source.url}\n' for i, source in enumerate(top_evidence))}
+
+ANALYSIS INSTRUCTIONS:
+1. Prioritize evidence from non-Wikipedia sources (news, academic, government sites)
+2. Give higher weight to sources with credibility scores above 85%
+3. Look for direct factual matches, not just topical relevance
+4. Consider multiple sources that corroborate the same information
+5. Be conservative with TRUE verdicts - require strong evidence
+
+VERDICT CRITERIA:
+- "TRUE": Claim is directly supported by multiple high-credibility sources
+- "FALSE": Claim is directly contradicted by credible sources  
+- "UNCERTAIN": Insufficient evidence, conflicting information, or only Wikipedia sources
+
+Provide your analysis in JSON format:
+{{
+    "VERDICT": "TRUE/FALSE/UNCERTAIN",
+    "CONFIDENCE": <float between 0.0 and 1.0>,
+    "EXPLANATION": "Detailed reasoning focusing on source quality and evidence strength",
+    "EVIDENCE_SUMMARY": "Summary of key supporting/contradicting evidence from top sources"
+}}
+"""
+
+        # Get LLM analysis
+        response = llm.invoke(analysis_prompt)
+        
+        try:
+            # Parse JSON response
+            response_text = response.content.strip()
+            if response_text.startswith('```json'):
+                response_text = response_text[7:-3]
+            elif response_text.startswith('```'):
+                response_text = response_text[3:-3]
+            
+            analysis = json.loads(response_text)
+            
+            # Validate verdict
+            verdict = analysis.get('VERDICT', 'UNCERTAIN').upper()
+            if verdict not in ['TRUE', 'FALSE', 'UNCERTAIN']:
+                verdict = 'UNCERTAIN'
+            
+            # Validate and adjust confidence
+            confidence = float(analysis.get('CONFIDENCE', 0.5))
+            confidence = max(0.0, min(1.0, confidence))
+            
+            # Boost confidence for non-Wikipedia sources
+            non_wiki_sources = sum(1 for e in top_evidence if e.source_domain != "wikipedia.org")
+            if non_wiki_sources >= 2:
+                confidence = min(1.0, confidence * 1.3)
+            elif non_wiki_sources == 0:
+                # Penalize Wikipedia-only results
+                confidence = max(0.0, confidence * 0.6)
+            
+            return FactCheckResult(
+                claim=claim,
+                verdict=verdict,
+                confidence=confidence,
+                explanation=analysis.get('EXPLANATION', 'No detailed explanation provided'),
+                sources=top_evidence,
+                evidence_summary=analysis.get('EVIDENCE_SUMMARY', 'No evidence summary provided')
+            )
+            
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Error parsing LLM response: {str(e)}")
+            return basic_semantic_analysis(claim, evidence)
+            
+    except Exception as e:
+        logger.error(f"Error in enhanced semantic analysis: {str(e)}")
+        return basic_semantic_analysis(claim, evidence)
+
+def fact_check_single_claim_enhanced(claim: Claim) -> FactCheckResult:
+    """
+    Enhanced single claim fact-checking with better error handling and retry logic.
+    """
+    max_retries = 2
+    
+    for attempt in range(max_retries):
+        try:
+            # Search for evidence with retry
+            with st.spinner(f"🔍 Searching for evidence (attempt {attempt + 1})..."):
+                evidence = search_claim_evidence(claim)
+            
+            if not evidence:
+                if attempt < max_retries - 1:
+                    st.warning(f"No evidence found, retrying...")
+                    time.sleep(2)
+                    continue
+                else:
+                    return FactCheckResult(
+                        claim=claim,
+                        verdict="UNCERTAIN",
+                        confidence=0.0,
+                        explanation="No evidence found through web search after multiple attempts.",
+                        sources=[],
+                        evidence_summary="No sources available for verification"
+                    )
+            
             # Analyze claim with evidence
             with st.spinner("🤖 Analyzing claim against evidence..."):
                 result = analyze_claim_with_evidence(claim, evidence)
-            return result
-        else:
-            return FactCheckResult(
-                claim=claim,
-                verdict="UNCERTAIN",
-                confidence=0.0,
-                explanation="No evidence found through web search to verify this claim.",
-                sources=[],
-                evidence_summary="No sources available for verification"
-            )
-            
-    except Exception as e:
-        logger.error(f"Error fact-checking single claim: {str(e)}")
-        return FactCheckResult(
-            claim=claim,
-            verdict="UNCERTAIN",
-            confidence=0.0,
-            explanation=f"Error during fact-checking: {str(e)}",
-            sources=[],
-            evidence_summary="Fact-checking failed due to technical error"
-        )
+                
+                # Log results for debugging
+                logger.info(f"Fact-check result: {result.verdict} (confidence: {result.confidence:.2f})")
+                logger.info(f"Sources used: {[s.source_domain for s in result.sources]}")
+                
+                return result
+                
+        except Exception as e:
+            logger.error(f"Error in fact-checking attempt {attempt + 1}: {str(e)}")
+            if attempt < max_retries - 1:
+                st.warning(f"Error occurred, retrying... ({str(e)})")
+                time.sleep(2)
+                continue
+            else:
+                return FactCheckResult(
+                    claim=claim,
+                    verdict="UNCERTAIN",
+                    confidence=0.0,
+                    explanation=f"Fact-checking failed after {max_retries} attempts: {str(e)}",
+                    sources=[],
+                    evidence_summary="Technical error prevented verification"
+                )
+    
+    # This shouldn't be reached, but just in case
+    return FactCheckResult(
+        claim=claim,
+        verdict="UNCERTAIN",
+        confidence=0.0,
+        explanation="Unknown error in fact-checking process",
+        sources=[],
+        evidence_summary="Fact-checking process failed"
+    )
 
 # Add these new functions
 def calculate_evidence_similarity(claim_text: str, evidence: List[SearchResult]) -> List[float]:
@@ -918,67 +1220,6 @@ def render_fact_check_results(results: List[FactCheckResult]):
                     st.markdown(f"   💬 {source.snippet}")
                     st.markdown("")
 
-def render_individual_claims_ui(claims: List[Claim]):
-    """Render UI for individual claim fact-checking."""
-    if not claims:
-        st.info("No claims available for fact-checking.")
-        return
-    
-    # Display each claim with a fact-check button
-    for i, claim in enumerate(claims):
-        with st.expander(f"Claim {i+1}: {claim.text[:100]}{'...' if len(claim.text) > 100 else ''}", expanded=False):
-            # Display claim details
-            st.markdown(f"**Full Claim:** {claim.text}")
-            st.markdown(f"**Source Chunk:** {claim.source_chunk}")
-            
-            # Fact-check button
-            if st.button(f"🔍 Fact-Check Claim {i+1}", key=f"factcheck_{i}"):
-                with st.spinner("Fact-checking claim..."):
-                    result = fact_check_single_claim(claim)
-                
-                # Display result
-                if result:
-                    render_single_claim_result(result)
-                else:
-                    st.error("Error fact-checking claim.")
-
-def render_single_claim_result(result: FactCheckResult):
-    """Render result for a single fact-checked claim."""
-    # Color coding
-    if result.verdict == "TRUE":
-        border_color = "#28a745"  # Green
-        emoji = "✅"
-    elif result.verdict == "FALSE":
-        border_color = "#dc3545"  # Red
-        emoji = "❌"
-    else:
-        border_color = "#ffc107"  # Yellow
-        emoji = "⚠️"
-    
-    # Result card
-    with st.container():
-        st.markdown(f"<div style='border: 2px solid {border_color}; padding: 10px; border-radius: 5px;'>", unsafe_allow_html=True)
-        st.markdown(f"**Verdict: {result.verdict}** {emoji}")
-        st.markdown(f"**Confidence:** {result.confidence:.1%}")
-        st.markdown(f"**Explanation:** {result.explanation}")
-        
-        # Evidence summary
-        if result.evidence_summary:
-            st.markdown("**Evidence Summary:**")
-            st.write(result.evidence_summary)
-        
-        # Sources
-        if result.sources:
-            st.markdown("**Sources:**")
-            for j, source in enumerate(result.sources[:3]):  # Show top 3 sources
-                credibility_color = "green" if source.credibility_score > 0.8 else "orange" if source.credibility_score > 0.6 else "red"
-                st.markdown(f"{j+1}. [{source.title}]({source.url})")
-                st.markdown(f"   📍 {source.source_domain} (:{credibility_color}[Credibility: {source.credibility_score:.1%}])")
-                st.markdown(f"   💬 {source.snippet}")
-                st.markdown("")
-        
-        st.markdown("</div>", unsafe_allow_html=True)
-
 # MAIN APPLICATION
 
 # Main UI Layout
@@ -986,7 +1227,7 @@ st.title("🎬 YouTube Video Q&A Bot with Fact Checker")
 st.markdown("Extract insights from YouTube videos and automatically verify factual claims.")
 
 # Tabs for different functionalities
-tab1, tab2, tab3 = st.tabs(["📺 Video Processing", "💬 Q&A Chat", "🔍 Fact Check"])
+tab1, tab2, tab3 = st.tabs(["📺 Video Processing", "💬 Q&A Chat", "🔍 Source Finder"])
 
 with tab1:
     st.header("Process YouTube Video")
@@ -1124,7 +1365,7 @@ with tab2:
             st.session_state.chat_history.append(AIMessage(content=answer))
 
 with tab3:
-    st.header("🔍 Fact Check Analysis")
+    st.header("🔍 Find Sources for Claims")
     
     if not hasattr(st.session_state, 'transcript_docs') or st.session_state.transcript_docs is None:
         st.info("👆 Please process a video first in the 'Video Processing' tab.")
@@ -1132,52 +1373,27 @@ with tab3:
         st.markdown(f"**Analyzing claims from:** {st.session_state.video_title}")
         
         # Extract claims section
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            if st.button("📝 Extract Claims from Transcript"):
-                try:
-                    with st.spinner("🔍 Analyzing transcript for factual claims..."):
-                        claims = extract_claims_from_transcript(st.session_state.transcript_docs)
-                        st.session_state.extracted_claims = claims
-                        # Clear previous results when extracting new claims
-                        st.session_state.claim_results = {}
+        if st.button("📝 Extract Claims from Transcript"):
+            try:
+                with st.spinner("🔍 Analyzing transcript for factual claims..."):
+                    claims = extract_claims_from_transcript(st.session_state.transcript_docs)
+                    st.session_state.extracted_claims = claims
+                
+                if claims:
+                    st.success(f"✅ Found {len(claims)} claims to check!")
+                else:
+                    st.warning("⚠️ No specific claims found in this transcript.")
                     
-                    if claims:
-                        st.success(f"✅ Extracted {len(claims)} verifiable claims!")
-                    else:
-                        st.warning("⚠️ No specific factual claims found in this transcript.")
-                        
-                except Exception as e:
-                    st.error(f"Error extracting claims: {str(e)}")
-        
-        with col2:
-            # Bulk fact-check option
-            if st.session_state.extracted_claims:
-                if st.button("🚀 Fact Check All", help="Fact-check all claims at once (uses more API calls)"):
-                    try:
-                        with st.spinner("⚡ Fact-checking all claims... This may take a while."):
-                            progress_bar = st.progress(0)
-                            
-                            for i, claim in enumerate(st.session_state.extracted_claims):
-                                claim_key = f"claim_{i}"
-                                result = fact_check_single_claim(claim)
-                                st.session_state.claim_results[claim_key] = result
-                                progress_bar.progress((i + 1) / len(st.session_state.extracted_claims))
-                                time.sleep(0.5)  # Rate limiting
-                            
-                            progress_bar.empty()
-                        st.success("✅ All claims fact-checked!")
-                        
-                    except Exception as e:
-                        st.error(f"Error during bulk fact-checking: {str(e)}")
+            except Exception as e:
+                st.error(f"Error extracting claims: {str(e)}")
         
         st.markdown("---")
         
-        # Display extracted claims with individual fact-check buttons
-        if st.session_state.extracted_claims:
+        # Display extracted claims with source finder
+        if hasattr(st.session_state, 'extracted_claims') and st.session_state.extracted_claims:
             render_individual_claims_ui(st.session_state.extracted_claims)
         else:
-            st.info("📝 Click 'Extract Claims from Transcript' to find factual statements that can be verified.")
+            st.info("📝 Click 'Extract Claims from Transcript' to find statements to check.")
 
 # Sidebar - Configuration and Help
 with st.sidebar:
