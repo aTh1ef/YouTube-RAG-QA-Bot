@@ -473,40 +473,59 @@ def process_query(query, qa_chain):
 # NEW FACT-CHECKING FUNCTIONS
 
 def extract_claims_from_transcript(transcript_chunks: List[Document]) -> List[Claim]:
-    """Extract factual claims from transcript chunks using Gemini."""
+    """Extract factual claims from transcript chunks using Gemini with improved specificity."""
     llm = get_llm()
     if not llm:
         return []
     
     claims = []
     
+    # IMPROVED CLAIM EXTRACTION PROMPT
     claim_extraction_prompt = """
-    Analyze the following transcript chunk and extract all factual claims or statements that can be verified. 
-    Focus on:
-    - Specific statistics, numbers, dates, or measurements
-    - Historical facts or events
-    - Scientific claims or assertions
-    - Names of people, places, organizations
-    - Claims about cause and effect relationships
-    - Specific product claims or comparisons
-    
-    Ignore:
-    - Personal opinions or subjective statements
-    - General advice or recommendations
-    - Hypothetical scenarios
-    - Questions
-    
-    For each claim found, respond with a JSON object containing:
-    - "claim": the exact factual statement
-    - "category": type of claim (historical, scientific, statistical, etc.)
-    
-    If no verifiable claims are found, respond with an empty JSON array.
-    
-    Transcript chunk:
-    {chunk_content}
-    
-    Response format: JSON array of claim objects
-    """
+Analyze the following transcript chunk and extract ONLY specific, factual claims that can be independently verified.
+
+🟢 INCLUDE these types of verifiable claims:
+✅ **Numbers and statistics**: "The population is over 1.4 billion", "Revenue rose by 25% in 2023"
+✅ **Technical specifications**: "The phone has 8GB RAM", "Uses a 3nm chip", "It supports 5G connectivity"
+✅ **Scientific facts or assertions**: "Water boils at 100°C", "The human brain has over 80 billion neurons"
+✅ **Historical facts/events**: "World War II ended in 1945", "Tesla was founded in 2003"
+✅ **Performance claims**: "Battery lasts 12 hours", "Processes data 30% faster than the old model"
+✅ **Product feature assertions**: "Includes IP68 waterproofing", "Supports wireless charging"
+✅ **Economic/financial statements**: "Inflation hit 7% last year", "Bitcoin surged to $65,000 in 2021"
+✅ **Geopolitical claims**: "India is the world's largest democracy", "NATO was formed in 1949"
+✅ **Medical/health-related facts**: "Vitamin C boosts immunity", "This treatment reduces mortality by 20%"
+✅ **Comparisons with specifics**: "50% faster than previous model", "Costs $200 less than competitor"
+✅ **Named entity facts**: "Barack Obama was the 44th U.S. President", "The Amazon is the largest rainforest"
+
+🔴 EXCLUDE the following:
+❌ **Just names**: "iPhone 15", "Elon Musk", "NVIDIA"
+❌ **Vague references**: "This thing is amazing", "They say it works well"
+❌ **Subjective opinions**: "I think it's beautiful", "Sounds awesome", "In my opinion..."
+❌ **Generalized praise or criticism**: "Great product", "Terrible decision", "Amazing build quality"
+❌ **Advice or recommendations**: "You should try it", "I recommend buying it"
+❌ **Questions or hypotheticals**: "Should you invest?", "What if it fails?"
+❌ **Speculation or predictions**: "It might succeed", "Could change the world"
+❌ **Personal experiences**: "When I used it...", "I noticed..."
+
+📌 IMPORTANT RULES:
+- Each claim must be a **complete, standalone factual statement**
+- It must contain **specific, verifiable information** (numbers, names, data, relationships)
+- The claim must **make sense without any external or surrounding context**
+- Only extract **objective facts** that can be verified against reliable sources
+
+📦 Output Format:
+For each valid claim, return a JSON object with:
+- "claim": the complete factual statement (self-contained)
+- "category": the category of the claim (e.g., technical_spec, historical, performance, scientific, economic, geopolitical, health, comparison)
+
+If there are no valid claims, return an empty JSON array: `[]`
+
+Transcript chunk:
+{chunk_content}
+
+Response format: JSON array of claim objects only
+"""
+
     
     for i, chunk in enumerate(transcript_chunks):
         try:
@@ -707,7 +726,7 @@ def analyze_claim_with_evidence(claim: Claim, evidence: List[SearchResult]) -> F
         )
 
 def perform_fact_checking(transcript_chunks: List[Document]) -> List[FactCheckResult]:
-    """Main fact-checking pipeline."""
+    # Main fact-checking pipeline.
     results = []
     
     # Step 1: Extract claims
@@ -760,6 +779,39 @@ def perform_fact_checking(transcript_chunks: List[Document]) -> List[FactCheckRe
     progress_bar.empty()
     
     return results
+
+def fact_check_single_claim(claim: Claim) -> FactCheckResult:
+    """Fact-check a single claim on-demand."""
+    try:
+        # Search for evidence
+        with st.spinner(f"🔍 Searching for evidence about: {claim.text[:50]}..."):
+            evidence = search_claim_evidence(claim)
+        
+        if evidence:
+            # Analyze claim with evidence
+            with st.spinner("🤖 Analyzing claim against evidence..."):
+                result = analyze_claim_with_evidence(claim, evidence)
+            return result
+        else:
+            return FactCheckResult(
+                claim=claim,
+                verdict="UNCERTAIN",
+                confidence=0.0,
+                explanation="No evidence found through web search to verify this claim.",
+                sources=[],
+                evidence_summary="No sources available for verification"
+            )
+            
+    except Exception as e:
+        logger.error(f"Error fact-checking single claim: {str(e)}")
+        return FactCheckResult(
+            claim=claim,
+            verdict="UNCERTAIN",
+            confidence=0.0,
+            explanation=f"Error during fact-checking: {str(e)}",
+            sources=[],
+            evidence_summary="Fact-checking failed due to technical error"
+        )
 
 # UI COMPONENTS
 
@@ -830,6 +882,67 @@ def render_fact_check_results(results: List[FactCheckResult]):
                     st.markdown(f"   📍 {source.source_domain} (:{credibility_color}[Credibility: {source.credibility_score:.1%}])")
                     st.markdown(f"   💬 {source.snippet}")
                     st.markdown("")
+
+def render_individual_claims_ui(claims: List[Claim]):
+    """Render UI for individual claim fact-checking."""
+    if not claims:
+        st.info("No claims available for fact-checking.")
+        return
+    
+    # Display each claim with a fact-check button
+    for i, claim in enumerate(claims):
+        with st.expander(f"Claim {i+1}: {claim.text[:100]}{'...' if len(claim.text) > 100 else ''}", expanded=False):
+            # Display claim details
+            st.markdown(f"**Full Claim:** {claim.text}")
+            st.markdown(f"**Source Chunk:** {claim.source_chunk}")
+            
+            # Fact-check button
+            if st.button(f"🔍 Fact-Check Claim {i+1}", key=f"factcheck_{i}"):
+                with st.spinner("Fact-checking claim..."):
+                    result = fact_check_single_claim(claim)
+                
+                # Display result
+                if result:
+                    render_single_claim_result(result)
+                else:
+                    st.error("Error fact-checking claim.")
+
+def render_single_claim_result(result: FactCheckResult):
+    """Render result for a single fact-checked claim."""
+    # Color coding
+    if result.verdict == "TRUE":
+        border_color = "#28a745"  # Green
+        emoji = "✅"
+    elif result.verdict == "FALSE":
+        border_color = "#dc3545"  # Red
+        emoji = "❌"
+    else:
+        border_color = "#ffc107"  # Yellow
+        emoji = "⚠️"
+    
+    # Result card
+    with st.container():
+        st.markdown(f"<div style='border: 2px solid {border_color}; padding: 10px; border-radius: 5px;'>", unsafe_allow_html=True)
+        st.markdown(f"**Verdict: {result.verdict}** {emoji}")
+        st.markdown(f"**Confidence:** {result.confidence:.1%}")
+        st.markdown(f"**Explanation:** {result.explanation}")
+        
+        # Evidence summary
+        if result.evidence_summary:
+            st.markdown("**Evidence Summary:**")
+            st.write(result.evidence_summary)
+        
+        # Sources
+        if result.sources:
+            st.markdown("**Sources:**")
+            for j, source in enumerate(result.sources[:3]):  # Show top 3 sources
+                credibility_color = "green" if source.credibility_score > 0.8 else "orange" if source.credibility_score > 0.6 else "red"
+                st.markdown(f"{j+1}. [{source.title}]({source.url})")
+                st.markdown(f"   📍 {source.source_domain} (:{credibility_color}[Credibility: {source.credibility_score:.1%}])")
+                st.markdown(f"   💬 {source.snippet}")
+                st.markdown("")
+        
+        st.markdown("</div>", unsafe_allow_html=True)
 
 # MAIN APPLICATION
 
@@ -983,56 +1096,53 @@ with tab3:
     else:
         st.markdown(f"**Analyzing claims from:** {st.session_state.video_title}")
         
-        # Fact-checking controls
+        # Extract claims section
         col1, col2 = st.columns([2, 1])
         with col1:
-            if st.button("🔍 Start Fact Checking", disabled=st.session_state.fact_check_in_progress):
-                st.session_state.fact_check_in_progress = True
+            if st.button("📝 Extract Claims from Transcript"):
                 try:
-                    # Perform fact-checking
-                    results = perform_fact_checking(st.session_state.transcript_docs)
-                    st.session_state.fact_check_results = results
-                    st.success(f"✅ Fact-checking complete! Analyzed {len(results)} claims.")
+                    with st.spinner("🔍 Analyzing transcript for factual claims..."):
+                        claims = extract_claims_from_transcript(st.session_state.transcript_docs)
+                        st.session_state.extracted_claims = claims
+                        # Clear previous results when extracting new claims
+                        st.session_state.claim_results = {}
+                    
+                    if claims:
+                        st.success(f"✅ Extracted {len(claims)} verifiable claims!")
+                    else:
+                        st.warning("⚠️ No specific factual claims found in this transcript.")
+                        
                 except Exception as e:
-                    st.error(f"Error during fact-checking: {str(e)}")
-                finally:
-                    st.session_state.fact_check_in_progress = False
+                    st.error(f"Error extracting claims: {str(e)}")
         
         with col2:
-            if st.session_state.fact_check_results:
-                if st.button("📊 Export Results"):
-                    # Create export data
-                    export_data = []
-                    for result in st.session_state.fact_check_results:
-                        export_data.append({
-                            "claim": result.claim.text,
-                            "verdict": result.verdict,
-                            "confidence": f"{result.confidence:.1%}",
-                            "explanation": result.explanation,
-                            "evidence_summary": result.evidence_summary,
-                            "sources": [{"title": s.title, "url": s.url, "domain": s.source_domain} for s in result.sources[:3]]
-                        })
-                    
-                    # Convert to JSON for download
-                    import json
-                    json_data = json.dumps(export_data, indent=2)
-                    st.download_button(
-                        label="📥 Download JSON Report",
-                        data=json_data,
-                        file_name=f"fact_check_report_{st.session_state.video_title[:30]}.json",
-                        mime="application/json"
-                    )
+            # Bulk fact-check option
+            if st.session_state.extracted_claims:
+                if st.button("🚀 Fact Check All", help="Fact-check all claims at once (uses more API calls)"):
+                    try:
+                        with st.spinner("⚡ Fact-checking all claims... This may take a while."):
+                            progress_bar = st.progress(0)
+                            
+                            for i, claim in enumerate(st.session_state.extracted_claims):
+                                claim_key = f"claim_{i}"
+                                result = fact_check_single_claim(claim)
+                                st.session_state.claim_results[claim_key] = result
+                                progress_bar.progress((i + 1) / len(st.session_state.extracted_claims))
+                                time.sleep(0.5)  # Rate limiting
+                            
+                            progress_bar.empty()
+                        st.success("✅ All claims fact-checked!")
+                        
+                    except Exception as e:
+                        st.error(f"Error during bulk fact-checking: {str(e)}")
         
-        # Display progress if fact-checking is in progress
-        if st.session_state.fact_check_in_progress:
-            st.info("🔄 Fact-checking in progress... This may take a few minutes.")
+        st.markdown("---")
         
-        # Display results
-        if st.session_state.fact_check_results:
-            st.markdown("---")
-            render_fact_check_results(st.session_state.fact_check_results)
-        elif not st.session_state.fact_check_in_progress:
-            st.info("Click 'Start Fact Checking' to analyze claims from the video transcript.")
+        # Display extracted claims with individual fact-check buttons
+        if st.session_state.extracted_claims:
+            render_individual_claims_ui(st.session_state.extracted_claims)
+        else:
+            st.info("📝 Click 'Extract Claims from Transcript' to find factual statements that can be verified.")
 
 # Sidebar - Configuration and Help
 with st.sidebar:
