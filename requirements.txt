@@ -17,4 +17,6 @@ langchain-community
 langchain_huggingface
 youtube-transcript-api
 protobuf
-
+wikipedia
+beautifulsoup4
+scikit-learn
